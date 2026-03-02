@@ -1,0 +1,130 @@
+name: bfit
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: bfit
+      POSTGRES_USER: bfit
+      POSTGRES_PASSWORD: bfit
+    ports:
+      - "5433:5432"   # avoid host 5432 conflict
+    volumes:
+      - bfit_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bfit -d bfit"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - bfit_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  backend:
+    build:
+      context: ./WebGUI/backend
+      dockerfile: Dockerfile
+    environment:
+      DJANGO_SETTINGS_MODULE: bfitserver.settings
+      DATABASE_URL: postgres://bfit:bfit@postgres:5432/bfit
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_DEBUG: "1"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./WebGUI/backend/src:/app
+      - ./WebGUI/backend/storage:/storage
+    working_dir: /app
+    command: >
+      sh -c "
+      python manage.py migrate &&
+      python manage.py runserver 0.0.0.0:8000
+      "
+
+  ai_worker:
+    build:
+      context: ./WebGUI/backend
+      dockerfile: Dockerfile
+    environment:
+      DJANGO_SETTINGS_MODULE: bfitserver.settings
+      DATABASE_URL: postgres://bfit:bfit@postgres:5432/bfit
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_DEBUG: "1"
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./WebGUI/backend/src:/app
+      - ./WebGUI/backend/storage:/storage
+    working_dir: /app
+    command: python manage.py rqworker default
+
+  ai_worker_mon:
+    image: cjlapao/rq-dashboard:latest
+    ports:
+      - "9181:9181"
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      python3 -m rq_dashboard
+      --redis-url redis://redis:6379
+      --host 0.0.0.0
+      --port 9181
+      --debug
+
+  frontend:
+    build:
+      context: ./WebGUI/frontend
+      dockerfile: Dockerfile
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      backend:
+        condition: service_started
+    volumes:
+      - ./WebGUI/frontend:/app
+      - frontend_node_modules:/app/node_modules
+    working_dir: /app
+    command: >
+      sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+
+  nnunet:
+    build:
+      context: ./nnUnet
+      dockerfile: Dockerfile
+    environment:
+      NNUNET_RAW: /data/nnunet_raw
+      NNUNET_PREPROCESSED: /data/nnunet_preprocessed
+      NNUNET_RESULTS: /data/nnunet_results
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./nnUnet:/app
+      - ./data:/data
+    working_dir: /app
+    command: python api.py --host 0.0.0.0 --port 9000
+
+volumes:
+  bfit_pg:
+  bfit_redis:
+  frontend_node_modules:

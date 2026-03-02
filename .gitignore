@@ -1,0 +1,40 @@
+# dependencies
+node_modules/
+**/node_modules/
+
+# build outputs
+dist/
+build/
+.out/
+.next/
+coverage/
+
+# env files
+.env
+.env.*
+!.env.example
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# misc
+*.tgz
+EOF
+
+# nnUNet outputs / weights
+src/ai/nnunet_results/
+**/nnunet_results/
+**/nnUNet_results/
+**/*.pth
+**/*.pt
+**/*.ckpt
+**/*.onnx

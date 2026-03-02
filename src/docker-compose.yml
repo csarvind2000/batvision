@@ -1,0 +1,142 @@
+# docker-compose.yml
+services:
+  db:
+    image: postgres:16
+    container_name: bat-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bfit
+      POSTGRES_USER: bfit
+      POSTGRES_PASSWORD: bfit
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432" # host 5433 -> container 5432 (avoids conflict)
+
+  redis:
+    image: redis:7
+    container_name: bat-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  ai:
+    build:
+      context: ./ai
+    container_name: bat-ai
+    restart: unless-stopped
+    command: python app.py
+    environment:
+      - DEBUG_MODE=true
+
+      # ✅ unify output path with backend/worker logs: /storage/bat_outputs/<case_id>/*
+      - BAT_OUT_BASE=/storage/bat_outputs
+
+      # nnUNet env (adjust if needed)
+      - NNUNET_BASE=/app
+      - NNUNET_DATASET_ID=901
+      - NNUNET_CONFIG=3d_fullres
+      - NNUNET_TRAINER=nnUNetTrainerTopK10Loss_33os_1000epochs
+      - NNUNET_PLANS=nnUNetPlans
+      - NNUNET_FOLDS=0
+    volumes:
+      - ./ai:/app
+
+      # inputs + shared data folder
+      - ${BAT_DATA_HOST_DIR}:/BAT_DataFolder
+
+      # ✅ persist outputs on host
+      - ${BAT_DATA_HOST_DIR}/output:/storage/bat_outputs
+
+      # temp
+      - ai_tmp:/app/tmp
+    ports:
+      - "9000:9000"
+
+  backend:
+    build:
+      context: ./backend
+    container_name: bat-backend
+    restart: unless-stopped
+    command: >
+      sh -c "
+      python manage.py migrate &&
+      python manage.py runserver 0.0.0.0:8000
+      "
+    environment:
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+      - DJANGO_DEBUG=${DJANGO_DEBUG}
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - MEDIA_ROOT=${MEDIA_ROOT}
+
+      # ✅ backend should look for outputs here
+      - OUTPUT_ROOT=/storage/bat_outputs
+
+      - AI_BASE_URL=${AI_BASE_URL}
+      - AI_INFER_PATH=/infer
+    volumes:
+      - ./backend:/app
+      - ${BAT_DATA_HOST_DIR}:/BAT_DataFolder
+
+      # ✅ same persisted output mount
+      - ${BAT_DATA_HOST_DIR}/output:/storage/bat_outputs
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+      - ai
+
+  worker:
+    build:
+      context: ./backend
+    container_name: bat-worker
+    restart: unless-stopped
+    command: celery -A bfitserver worker --loglevel=info
+    environment:
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+      - DJANGO_DEBUG=${DJANGO_DEBUG}
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - MEDIA_ROOT=${MEDIA_ROOT}
+
+      # ✅ worker should read/write outputs here too
+      - OUTPUT_ROOT=/storage/bat_outputs
+
+      - AI_BASE_URL=${AI_BASE_URL}
+      - AI_INFER_PATH=/infer
+    volumes:
+      - ./backend:/app
+      - ${BAT_DATA_HOST_DIR}:/BAT_DataFolder
+
+      # ✅ same persisted output mount
+      - ${BAT_DATA_HOST_DIR}/output:/storage/bat_outputs
+    depends_on:
+      - backend
+      - redis
+      - ai
+
+  frontend:
+    build:
+      context: ./WebGUI/frontend
+    container_name: bat-frontend
+    restart: unless-stopped
+    command: npm run dev -- --host 0.0.0.0 --port 5173
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000
+    volumes:
+      - ./WebGUI/frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  ai_tmp:

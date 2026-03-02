@@ -33,8 +33,33 @@ Typical services (may vary by your repo):
 
 ### 1) Clone and go to project directory
 ```bash
-git clone <YOUR_REPO_URL>
-cd <YOUR_REPO_DIR>
+git clone https://github.com/csarvind2000/batvision.git
+cd batvision
+```
+
+### 1.1) Download Pretrained BAT Model Weights
+Model weights are NOT included in this repository due to GitHub size limits.
+
+Please download them from Google Drive:
+
+## Google Drive Folder
+```bash
+https://drive.google.com/drive/folders/1po6c_ogZZJr-FkMZljP1w_1HhSXylw4J?usp=sharing
+```
+
+### 1.2) After Downloading
+
+Place the downloaded folder inside:
+
+## Google Drive Folder
+```bash
+src/ai/nnunet_results/
+└── Dataset901_BAT_Longitudinal_UNION_45y_6y/
+    └── nnUNetTrainerTopK10Loss_33os_1000epochs__nnUNetPlans__3d_fullres/
+        ├── fold_0/
+        ├── fold_1/
+        ├── fold_2/
+        └── fold_3/
 ```
 
 ### 2) Create environment file(s)

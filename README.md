@@ -1,4 +1,4 @@
-# BATVision (BAT Review) — Docker Setup
+# BATVision — Docker Setup
 
 BATVision is a web-based platform for **Brown Adipose Tissue (BAT)** segmentation review and volumetric analysis.  
 This repository provides a **Docker-based** way to run the full stack locally (frontend + backend + workers + database/redis as applicable).
@@ -61,6 +61,13 @@ src/ai/nnunet_results/
         ├── fold_2/
         └── fold_3/
 ```
+## 📹 BATVision Demo
+
+🎬 Check out the demo video here:
+
+[![BATVision Demo](https://img.youtube.com/vi/993zxbC57AM/0.jpg)](https://www.youtube.com/watch?v=993zxbC57AM)
+
+➡️ Click the image to watch the full video on YouTube!
 
 ### 2) Create environment file(s)
 
@@ -69,6 +76,7 @@ Create a `.env` at the repository root (or wherever your compose expects it):
 ```bash
 cp .env.example .env  # if available
 ```
+
 
 Minimum example:
 

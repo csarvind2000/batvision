@@ -339,19 +339,3 @@ Usually caused by:
 └── README.md
 ```
 
----
-
-## License / Citation
-
-Add your lab/company + citation details here.
-
----
-
-## Contact
-
-- Maintainer: Arvind CS
-- Email: <add email>
-# BATAPP
-# batvision
-# batvision
-# batvision

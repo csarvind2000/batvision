@@ -12,22 +12,31 @@ import {
   DialogContent,
   DialogTitle,
   DialogActions,
-  Chip,
   LinearProgress,
-  Collapse,
-  Divider,
   MenuItem,
   Select,
-  InputLabel,
   FormControl,
   Paper,
   Checkbox,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Tooltip,
+  CircularProgress,
+  InputAdornment,
 } from "@mui/material";
 import CloudUploadIcon from "@mui/icons-material/CloudUpload";
 import RefreshIcon from "@mui/icons-material/Refresh";
-import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
-import FolderIcon from "@mui/icons-material/Folder";
+import TableChartIcon from "@mui/icons-material/TableChart";
 import CloseIcon from "@mui/icons-material/Close";
+import SearchIcon from "@mui/icons-material/Search";
+import DownloadIcon from "@mui/icons-material/Download";
+import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
+import ReplayIcon from "@mui/icons-material/Replay";
+import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 
 import {
   apiListCases,
@@ -35,7 +44,9 @@ import {
   apiTriggerProcessing,
   apiGetCaseStatus,
   apiDeleteCases,
+  apiCohortExport,
 } from "../api/client";
+import { C, BORDER, panelSx } from "./batReview/theme";
 
 type CaseStatus = "PROCESSING" | "FAILED" | "READY";
 
@@ -51,27 +62,74 @@ type CaseItem = {
   [key: string]: any;
 };
 
-function statusChip(status: CaseStatus) {
-  switch (status) {
-    case "PROCESSING":
-      return <Chip size="small" label="Processing" color="warning" variant="outlined" />;
-    case "FAILED":
-      return <Chip size="small" label="Processing failed" color="error" variant="outlined" />;
-    case "READY":
-      return <Chip size="small" label="Ready to review" color="success" variant="outlined" />;
-  }
+const STATUS_META: Record<CaseStatus, { label: string; color: string }> = {
+  READY: { label: "Ready to review", color: C.ok },
+  PROCESSING: { label: "Processing", color: C.warn },
+  FAILED: { label: "Failed", color: C.danger },
+};
+
+/** A coloured dot plus a word reads faster down a column than a boxed chip. */
+function StatusCell({ status }: { status: CaseStatus }) {
+  const meta = STATUS_META[status] ?? { label: status, color: C.textMuted };
+  return (
+    <Stack direction="row" spacing={1} alignItems="center">
+      <Box
+        sx={{
+          width: 7,
+          height: 7,
+          borderRadius: "50%",
+          bgcolor: meta.color,
+          flexShrink: 0,
+          // a soft halo keeps the dot legible against the row hover colour
+          boxShadow: `0 0 0 3px ${meta.color}22`,
+        }}
+      />
+      <Typography sx={{ fontSize: 12.5, color: C.text, whiteSpace: "nowrap" }}>
+        {meta.label}
+      </Typography>
+    </Stack>
+  );
 }
 
 function formatDate(iso?: string) {
   if (!iso) return "-";
   const d = new Date(iso);
-  return d.toLocaleString();
+  return Number.isNaN(d.getTime()) ? "-" : d.toLocaleString();
+}
+
+/**
+ * "3 min ago" scans far better in a worklist than a repeated absolute
+ * timestamp; the exact time stays available on hover.
+ */
+function relativeTime(iso?: string): string {
+  if (!iso) return "—";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "—";
+  const secs = Math.round((Date.now() - then) / 1000);
+  if (secs < 45) return "just now";
+  const steps: [number, string][] = [
+    [60, "min"],
+    [60, "hr"],
+    [24, "day"],
+  ];
+  let value = secs / 60;
+  let unit = "min";
+  for (let i = 1; i < steps.length; i++) {
+    if (Math.abs(value) < steps[i][0]) break;
+    value /= steps[i][0];
+    unit = steps[i][1];
+  }
+  const n = Math.round(value);
+  return `${n} ${unit}${Math.abs(n) === 1 ? "" : "s"} ago`;
 }
 
 export default function Cases() {
   const navigate = useNavigate();
 
-  const [cases, setCases] = React.useState<(CaseItem & { expanded?: boolean })[]>([]);
+  const [cases, setCases] = React.useState<CaseItem[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [listError, setListError] = React.useState("");
+  const [exportBusy, setExportBusy] = React.useState(false);
   const [selected, setSelected] = React.useState<Record<string, boolean>>({});
   const [search, setSearch] = React.useState("");
   const [statusFilter, setStatusFilter] = React.useState<"" | CaseStatus>("");
@@ -90,23 +148,29 @@ export default function Cases() {
   const folderInputRef = React.useRef<HTMLInputElement | null>(null);
 
   const refresh = React.useCallback(async () => {
-    const data = await apiListCases();
-
-    setCases(
-      (data || []).map((c: any) => ({
-        ...c,
-        subject_id:
-          c.subject_id ||
-          c.subjectId ||
-          c.case_id ||
-          c.caseId ||
-          c.case_name ||
-          c.caseName ||
-          c.name ||
-          c.subject,
-        expanded: false,
-      }))
-    );
+    try {
+      setListError("");
+      const data = await apiListCases();
+      setCases(
+        (data || []).map((c: any) => ({
+          ...c,
+          subject_id:
+            c.subject_id ||
+            c.subjectId ||
+            c.case_id ||
+            c.caseId ||
+            c.case_name ||
+            c.caseName ||
+            c.name ||
+            c.subject,
+        }))
+      );
+    } catch (e: any) {
+      // Previously this rejected unhandled and the page just stayed blank.
+      setListError(e?.message || "Could not load cases.");
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   React.useEffect(() => {
@@ -152,10 +216,6 @@ export default function Cases() {
   });
 
   const selectedIds = Object.keys(selected).filter((id) => selected[id]);
-
-  const toggleExpand = (id: string) => {
-    setCases((prev) => prev.map((c) => (c.id === id ? { ...c, expanded: !c.expanded } : c)));
-  };
 
   // naming rule
   function isValidNiftiName(name: string) {
@@ -260,6 +320,35 @@ export default function Cases() {
     }
   };
 
+  const exportSelected = React.useCallback(async () => {
+    if (selectedIds.length === 0) return;
+    try {
+      setExportBusy(true);
+      const { blob, filename } = await apiCohortExport("xlsx", selectedIds);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      setListError(e?.message || "Export failed.");
+    } finally {
+      setExportBusy(false);
+    }
+  }, [selectedIds]);
+
+  const allShownSelected =
+    filtered.length > 0 && filtered.every((c) => selected[c.id]);
+
+  const toggleAllShown = () =>
+    setSelected((prev) => {
+      const next = { ...prev };
+      if (allShownSelected) filtered.forEach((c) => delete next[c.id]);
+      else filtered.forEach((c) => (next[c.id] = true));
+      return next;
+    });
+
   // ---- DELETE ----
   const openDeleteDialog = () => {
     if (selectedIds.length === 0) return;
@@ -291,232 +380,396 @@ export default function Cases() {
     }
   };
 
+  const readyCount = cases.filter((c) => c.status === "READY").length;
+  const busyCount = cases.filter((c) => c.status === "PROCESSING").length;
+
+  const headCellSx = {
+    bgcolor: C.surfaceInset,
+    borderBottom: BORDER,
+    color: C.textFaint,
+    fontSize: 11,
+    fontWeight: 700,
+    letterSpacing: 0.6,
+    textTransform: "uppercase" as const,
+    py: 1,
+  };
+
   return (
     <Box
       sx={{
-        minHeight: "100vh",
-        bgcolor: "#0f1115",
-        p: 2,
-        "& .MuiTypography-root": { color: "#eaeef6" },
+        height: "100vh",
+        bgcolor: C.bg,
+        p: 2.5,
+        display: "flex",
+        flexDirection: "column",
+        gap: 2,
       }}
     >
-      {/* Top Bar */}
-      <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 2 }}>
-        <Stack direction="row" spacing={1.5} alignItems="center">
-          <FolderIcon sx={{ color: "#a78bfa" }} />
-          <Typography variant="h6" sx={{ fontWeight: 700 }}>
+      {/* ── header ─────────────────────────────────────────────────────── */}
+      <Stack direction="row" alignItems="center" spacing={1.5}>
+        <Box>
+          <Typography sx={{ color: C.text, fontWeight: 800, fontSize: 20, lineHeight: 1.2 }}>
             BAT Cases
           </Typography>
-        </Stack>
-
-        <Stack direction="row" spacing={1}>
-          <IconButton onClick={refresh} sx={{ color: "#cbd5e1" }}>
-            <RefreshIcon />
-          </IconButton>
-
-          <Button
-            variant="contained"
-            startIcon={<CloudUploadIcon />}
-            onClick={() => setUploadOpen(true)}
-            sx={{
-              bgcolor: "#7c3aed",
-              "&:hover": { bgcolor: "#6d28d9" },
-              borderRadius: 2,
-              textTransform: "none",
-            }}
-          >
-            Upload Case(s)
-          </Button>
-        </Stack>
-      </Stack>
-
-      {/* Filters */}
-      <Stack direction="row" spacing={1.5} alignItems="center" sx={{ mb: 2 }}>
-        <TextField
-          size="small"
-          placeholder="Search by Subject ID"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          sx={{
-            width: 320,
-            "& .MuiInputBase-root": { bgcolor: "#111827", color: "#eaeef6" },
-            "& input::placeholder": { color: "#9ca3af" },
-          }}
-        />
-
-        <FormControl size="small" sx={{ minWidth: 180 }}>
-          <InputLabel sx={{ color: "#9ca3af" }}>Study Status</InputLabel>
-          <Select
-            label="Study Status"
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value as any)}
-            sx={{
-              bgcolor: "#111827",
-              color: "#eaeef6",
-              ".MuiSvgIcon-root": { color: "#9ca3af" },
-            }}
-          >
-            <MenuItem value="">All</MenuItem>
-            <MenuItem value="PROCESSING">Processing</MenuItem>
-            <MenuItem value="FAILED">Processing failed</MenuItem>
-            <MenuItem value="READY">Ready to review</MenuItem>
-          </Select>
-        </FormControl>
+          <Typography sx={{ color: C.textFaint, fontSize: 12 }}>
+            {cases.length} case{cases.length === 1 ? "" : "s"} · {readyCount} ready
+            {busyCount > 0 ? ` · ${busyCount} processing` : ""}
+          </Typography>
+        </Box>
 
         <Box sx={{ flex: 1 }} />
 
-        <Button
-          variant="outlined"
-          disabled={selectedIds.length === 0}
-          sx={{ borderColor: "#374151", color: "#eaeef6", textTransform: "none" }}
-          onClick={() => console.log("Export selected", selectedIds)}
-        >
-          Export
-        </Button>
+        <Tooltip title="Refresh">
+          <IconButton onClick={refresh} sx={{ color: C.textMuted }}>
+            <RefreshIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
 
         <Button
           variant="outlined"
-          disabled={selectedIds.length === 0}
-          sx={{ borderColor: "#374151", color: "#eaeef6", textTransform: "none" }}
-          onClick={openDeleteDialog}
+          size="small"
+          startIcon={<TableChartIcon />}
+          onClick={() => navigate("/cohort")}
+          sx={{
+            color: C.text,
+            borderColor: C.border,
+            textTransform: "none",
+            "&:hover": { borderColor: C.accent, bgcolor: "rgba(124,156,245,0.08)" },
+          }}
         >
-          Delete
+          Cohort
+        </Button>
+
+        <Button
+          variant="contained"
+          size="small"
+          startIcon={<CloudUploadIcon />}
+          onClick={() => setUploadOpen(true)}
+          sx={{
+            bgcolor: C.accentDim,
+            textTransform: "none",
+            fontWeight: 600,
+            "&:hover": { bgcolor: C.accent },
+          }}
+        >
+          Upload cases
         </Button>
       </Stack>
 
-      {/* List */}
-      <Stack spacing={1.5}>
-        {filtered.map((c) => (
-          <Paper
-            key={c.id}
-            elevation={0}
-            sx={{
-              bgcolor: "#111827",
-              border: "1px solid #1f2937",
-              borderRadius: 2,
-              overflow: "hidden",
+      {/* ── filters + bulk actions ─────────────────────────────────────── */}
+      <Paper sx={{ ...panelSx, px: 1.25, py: 1 }}>
+        <Stack direction="row" spacing={1.25} alignItems="center" flexWrap="wrap" useFlexGap>
+          <TextField
+            size="small"
+            placeholder="Search subject ID"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            InputProps={{
+              startAdornment: (
+                <InputAdornment position="start">
+                  <SearchIcon sx={{ fontSize: 17, color: C.textFaint }} />
+                </InputAdornment>
+              ),
             }}
-          >
-            <Box sx={{ p: 1.5 }}>
-              <Stack direction="row" alignItems="center" spacing={1.5}>
-                <Checkbox
-                  checked={!!selected[c.id]}
-                  onChange={(e) => setSelected((prev) => ({ ...prev, [c.id]: e.target.checked }))}
-                  sx={{ color: "#374151", "&.Mui-checked": { color: "#a78bfa" } }}
-                />
+            sx={{
+              width: 260,
+              "& .MuiOutlinedInput-root": { color: C.text, fontSize: 13, bgcolor: C.surfaceInset },
+              "& fieldset": { borderColor: C.border },
+              "& input::placeholder": { color: C.textFaint, opacity: 1 },
+            }}
+          />
 
-                <Box sx={{ minWidth: 260 }}>
-                  <Typography sx={{ fontWeight: 800, color: "#ffffff" }}>
-                    {c.subject_id || c.case_id || c.case_name || "(missing subject_id)"}
-                  </Typography>
+          <FormControl size="small" sx={{ minWidth: 170 }}>
+            <Select
+              displayEmpty
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value as any)}
+              sx={{
+                bgcolor: C.surfaceInset,
+                color: C.text,
+                fontSize: 13,
+                "& fieldset": { borderColor: C.border },
+                ".MuiSvgIcon-root": { color: C.textFaint },
+              }}
+            >
+              <MenuItem value="">All statuses</MenuItem>
+              <MenuItem value="READY">Ready to review</MenuItem>
+              <MenuItem value="PROCESSING">Processing</MenuItem>
+              <MenuItem value="FAILED">Failed</MenuItem>
+            </Select>
+          </FormControl>
 
-                  <Typography variant="caption" sx={{ color: "#9ca3af" }}>
-                    Uploaded: {formatDate(c.created_at)}
-                  </Typography>
-                </Box>
+          <Box sx={{ flex: 1 }} />
 
-                <Box sx={{ flex: 1 }} />
+          {/* Bulk actions only exist once something is selected, so the bar is
+              not a row of permanently greyed-out buttons. */}
+          {selectedIds.length > 0 && (
+            <>
+              <Typography sx={{ color: C.textMuted, fontSize: 12.5 }}>
+                {selectedIds.length} selected
+              </Typography>
+              <Button
+                size="small"
+                startIcon={<DownloadIcon />}
+                onClick={exportSelected}
+                disabled={exportBusy}
+                sx={{ color: C.text, textTransform: "none" }}
+              >
+                {exportBusy ? "Exporting…" : "Export"}
+              </Button>
+              <Button
+                size="small"
+                startIcon={<DeleteOutlineIcon />}
+                onClick={openDeleteDialog}
+                sx={{ color: C.danger, textTransform: "none" }}
+              >
+                Delete
+              </Button>
+              <Button
+                size="small"
+                onClick={() => setSelected({})}
+                sx={{ color: C.textFaint, textTransform: "none" }}
+              >
+                Clear
+              </Button>
+            </>
+          )}
+        </Stack>
+      </Paper>
 
-                {statusChip(c.status)}
+      {listError && (
+        <Paper sx={{ ...panelSx, p: 1.5, borderColor: C.danger }}>
+          <Stack direction="row" spacing={1} alignItems="center">
+            <ErrorOutlineIcon sx={{ color: C.danger, fontSize: 18 }} />
+            <Typography sx={{ color: C.danger, fontSize: 13 }}>{listError}</Typography>
+          </Stack>
+        </Paper>
+      )}
 
-                <IconButton
-                  onClick={() => toggleExpand(c.id)}
-                  sx={{
-                    color: "#cbd5e1",
-                    transform: c.expanded ? "rotate(180deg)" : "none",
-                  }}
+      {/* ── worklist ───────────────────────────────────────────────────── */}
+      <Paper
+        sx={{
+          ...panelSx,
+          flex: 1,
+          minHeight: 0,
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+        }}
+      >
+        {loading ? (
+          <Box sx={{ flex: 1, display: "grid", placeItems: "center" }}>
+            <CircularProgress size={26} sx={{ color: C.accent }} />
+          </Box>
+        ) : filtered.length === 0 ? (
+          <Box sx={{ flex: 1, display: "grid", placeItems: "center", px: 3 }}>
+            <Stack spacing={1} alignItems="center">
+              <Typography sx={{ color: C.textMuted, fontSize: 14 }}>
+                {cases.length === 0 ? "No cases yet" : "No case matches these filters"}
+              </Typography>
+              <Typography sx={{ color: C.textFaint, fontSize: 12.5, textAlign: "center" }}>
+                {cases.length === 0
+                  ? "Upload a folder of subjects to get started — each subfolder becomes a case."
+                  : "Try clearing the search box or the status filter."}
+              </Typography>
+              {cases.length === 0 && (
+                <Button
+                  variant="outlined"
+                  size="small"
+                  startIcon={<CloudUploadIcon />}
+                  onClick={() => setUploadOpen(true)}
+                  sx={{ mt: 1, color: C.text, borderColor: C.border, textTransform: "none" }}
                 >
-                  <ExpandMoreIcon />
-                </IconButton>
-              </Stack>
-
-              {c.status === "PROCESSING" && (
-                <Box sx={{ mt: 1 }}>
-                  <LinearProgress
-                    variant={typeof c.progress === "number" ? "determinate" : "indeterminate"}
-                    value={c.progress ?? 0}
-                    sx={{
-                      height: 6,
-                      borderRadius: 999,
-                      bgcolor: "#0b1220",
-                      "& .MuiLinearProgress-bar": { bgcolor: "#a78bfa" },
-                    }}
-                  />
-                  <Typography variant="caption" sx={{ color: "#9ca3af" }}>
-                    {c.status_message ?? "Processing…"}{" "}
-                    {typeof c.progress === "number" ? `(${c.progress}%)` : ""}
-                  </Typography>
-                </Box>
+                  Upload cases
+                </Button>
               )}
+            </Stack>
+          </Box>
+        ) : (
+          <TableContainer sx={{ flex: 1 }}>
+            <Table size="small" stickyHeader>
+              <TableHead>
+                <TableRow>
+                  <TableCell padding="checkbox" sx={headCellSx}>
+                    <Checkbox
+                      size="small"
+                      checked={allShownSelected}
+                      indeterminate={!allShownSelected && filtered.some((c) => selected[c.id])}
+                      onChange={toggleAllShown}
+                      sx={{ color: C.textFaint, "&.Mui-checked": { color: C.accent } }}
+                    />
+                  </TableCell>
+                  <TableCell sx={headCellSx}>Subject</TableCell>
+                  <TableCell sx={{ ...headCellSx, width: 260 }}>Status</TableCell>
+                  <TableCell sx={{ ...headCellSx, width: 150 }}>Uploaded</TableCell>
+                  <TableCell sx={{ ...headCellSx, width: 190 }} align="right">
+                    Actions
+                  </TableCell>
+                </TableRow>
+              </TableHead>
 
-              {c.status === "FAILED" && c.status_message && (
-                <Typography variant="caption" sx={{ color: "#f87171", display: "block", mt: 0.8 }}>
-                  {c.status_message}
-                </Typography>
-              )}
-            </Box>
+              <TableBody>
+                {filtered.map((c) => {
+                  const isSelected = !!selected[c.id];
+                  return (
+                    <TableRow
+                      key={c.id}
+                      hover
+                      selected={isSelected}
+                      onDoubleClick={() =>
+                        c.status === "READY" && navigate(`/analysis/${c.id}/review`)
+                      }
+                      sx={{
+                        cursor: c.status === "READY" ? "pointer" : "default",
+                        "& td": { borderBottom: BORDER, py: 0.75 },
+                        "&.Mui-selected, &.Mui-selected:hover": {
+                          bgcolor: "rgba(124,156,245,0.10)",
+                        },
+                      }}
+                    >
+                      <TableCell padding="checkbox">
+                        <Checkbox
+                          size="small"
+                          checked={isSelected}
+                          onChange={(e) =>
+                            setSelected((prev) => ({ ...prev, [c.id]: e.target.checked }))
+                          }
+                          onDoubleClick={(e) => e.stopPropagation()}
+                          sx={{ color: C.textFaint, "&.Mui-checked": { color: C.accent } }}
+                        />
+                      </TableCell>
 
-            <Collapse in={!!c.expanded}>
-              <Divider sx={{ borderColor: "#1f2937" }} />
-              <Box sx={{ p: 1.5, bgcolor: "#0b1220" }}>
-                <Stack direction="row" spacing={1} sx={{ mt: 2 }}>
-                  <Button
-                    variant="contained"
-                    disabled={c.status !== "READY"}
-                    sx={{
-                      bgcolor: "#7c3aed",
-                      "&:hover": { bgcolor: "#6d28d9" },
-                      textTransform: "none",
-                    }}
-                    onClick={() => navigate(`/analysis/${c.id}/review`)}
-                  >
-                    Review
-                  </Button>
+                      <TableCell>
+                        <Typography
+                          sx={{
+                            color: C.text,
+                            fontSize: 13.5,
+                            fontWeight: 700,
+                            fontVariantNumeric: "tabular-nums",
+                          }}
+                        >
+                          {c.subject_id || c.case_id || c.case_name || "(no subject id)"}
+                        </Typography>
+                        {c.status === "FAILED" && c.status_message && (
+                          <Tooltip title={c.status_message}>
+                            <Typography
+                              sx={{
+                                color: C.danger,
+                                fontSize: 11.5,
+                                maxWidth: 560,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {c.status_message}
+                            </Typography>
+                          </Tooltip>
+                        )}
+                      </TableCell>
 
-                  <Button
-                    variant="outlined"
-                    sx={{ borderColor: "#374151", color: "#eaeef6", textTransform: "none" }}
-                    onClick={async () => {
-                      await apiTriggerProcessing([c.id]);
-                      await refresh();
-                    }}
-                  >
-                    Re-run AI
-                  </Button>
-                </Stack>
-              </Box>
-            </Collapse>
-          </Paper>
-        ))}
-      </Stack>
+                      <TableCell>
+                        <StatusCell status={c.status} />
+                        {c.status === "PROCESSING" && (
+                          <Box sx={{ mt: 0.75, maxWidth: 220 }}>
+                            <LinearProgress
+                              variant={
+                                typeof c.progress === "number" ? "determinate" : "indeterminate"
+                              }
+                              value={c.progress ?? 0}
+                              sx={{
+                                height: 3,
+                                borderRadius: 999,
+                                bgcolor: C.surfaceInset,
+                                "& .MuiLinearProgress-bar": { bgcolor: C.warn },
+                              }}
+                            />
+                            <Typography sx={{ color: C.textFaint, fontSize: 11, mt: 0.25 }}>
+                              {c.status_message ?? "Processing…"}
+                              {typeof c.progress === "number" ? ` · ${c.progress}%` : ""}
+                            </Typography>
+                          </Box>
+                        )}
+                      </TableCell>
+
+                      <TableCell>
+                        <Tooltip title={formatDate(c.created_at)}>
+                          <Typography sx={{ color: C.textMuted, fontSize: 12.5 }}>
+                            {relativeTime(c.created_at)}
+                          </Typography>
+                        </Tooltip>
+                      </TableCell>
+
+                      <TableCell align="right">
+                        <Stack direction="row" spacing={0.75} justifyContent="flex-end">
+                          <Button
+                            size="small"
+                            variant={c.status === "READY" ? "contained" : "outlined"}
+                            disabled={c.status !== "READY"}
+                            onClick={() => navigate(`/analysis/${c.id}/review`)}
+                            sx={{
+                              textTransform: "none",
+                              minWidth: 78,
+                              ...(c.status === "READY"
+                                ? { bgcolor: C.accentDim, "&:hover": { bgcolor: C.accent } }
+                                : { color: C.textFaint, borderColor: C.border }),
+                            }}
+                          >
+                            Review
+                          </Button>
+                          <Tooltip title="Re-run AI on this case">
+                            <span>
+                              <IconButton
+                                size="small"
+                                disabled={c.status === "PROCESSING"}
+                                onClick={async () => {
+                                  await apiTriggerProcessing([c.id]);
+                                  await refresh();
+                                }}
+                                sx={{ color: C.textMuted, "&:hover": { color: C.text } }}
+                              >
+                                <ReplayIcon sx={{ fontSize: 17 }} />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                        </Stack>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        )}
+      </Paper>
 
       {/* Delete Confirmation */}
       <Dialog open={deleteOpen} onClose={closeDeleteDialog} maxWidth="md" fullWidth>
-        <DialogTitle sx={{ bgcolor: "#0b1220", color: "#eaeef6", fontWeight: 800 }}>
+        <DialogTitle sx={{ bgcolor: C.surface, color: C.text, fontWeight: 800 }}>
           Delete Confirmation
         </DialogTitle>
 
-        <DialogContent sx={{ bgcolor: "#0b1220", color: "#eaeef6", pt: 2 }}>
-          <Typography sx={{ color: "#cbd5e1", mb: 1 }}>
+        <DialogContent sx={{ bgcolor: C.surface, color: C.text, pt: 2 }}>
+          <Typography sx={{ color: C.textMuted, mb: 1 }}>
             Are you sure you want to delete <b>{selectedIds.length}</b> case(s)?
           </Typography>
 
-          <Typography sx={{ color: "#f87171", fontWeight: 700 }}>
+          <Typography sx={{ color: C.danger, fontWeight: 700 }}>
             This action cannot be undone
           </Typography>
 
-          {deleteError && <Typography sx={{ color: "#f87171", mt: 1 }}>{deleteError}</Typography>}
+          {deleteError && <Typography sx={{ color: C.danger, mt: 1 }}>{deleteError}</Typography>}
         </DialogContent>
 
-        <DialogActions sx={{ bgcolor: "#0b1220", p: 2 }}>
+        <DialogActions sx={{ bgcolor: C.surface, p: 2 }}>
           <Button
             variant="outlined"
             onClick={closeDeleteDialog}
             disabled={deleteBusy}
             sx={{
               flex: 1,
-              borderColor: "#cbd5e1",
-              color: "#eaeef6",
+              borderColor: C.textMuted,
+              color: C.text,
               textTransform: "none",
               borderRadius: 2,
               height: 46,
@@ -531,25 +784,25 @@ export default function Cases() {
             disabled={deleteBusy || selectedIds.length === 0}
             sx={{
               flex: 1,
-              bgcolor: "#7c3aed",
-              "&:hover": { bgcolor: "#6d28d9" },
+              bgcolor: C.danger,
+              "&:hover": { bgcolor: "#dc4c4c" },
               textTransform: "none",
               borderRadius: 2,
               height: 46,
             }}
           >
-            {deleteBusy ? "Deleting..." : "Confirm Delete"}
+            {deleteBusy ? "Deleting…" : `Delete ${selectedIds.length} case${selectedIds.length === 1 ? "" : "s"}`}
           </Button>
         </DialogActions>
       </Dialog>
 
       {/* Upload Dialog */}
       <Dialog open={uploadOpen} onClose={() => (uploadBusy ? null : setUploadOpen(false))} maxWidth="md" fullWidth>
-        <DialogContent sx={{ bgcolor: "#0b1220", color: "#eaeef6", position: "relative", p: 3 }}>
+        <DialogContent sx={{ bgcolor: C.surface, color: C.text, position: "relative", p: 3 }}>
           <IconButton
             onClick={() => setUploadOpen(false)}
             disabled={uploadBusy}
-            sx={{ position: "absolute", right: 10, top: 10, color: "#cbd5e1" }}
+            sx={{ position: "absolute", right: 10, top: 10, color: C.textMuted }}
           >
             <CloseIcon />
           </IconButton>
@@ -558,7 +811,7 @@ export default function Cases() {
             Upload BAT Case(s)
           </Typography>
 
-          <Typography variant="body2" sx={{ color: "#9ca3af", mb: 2 }}>
+          <Typography variant="body2" sx={{ color: C.textFaint, mb: 2 }}>
             Naming rule:
             <br />
             <b>&lt;SUBJECT&gt;_F_0000.nii.gz</b> = FAT
@@ -566,20 +819,20 @@ export default function Cases() {
             <b>&lt;SUBJECT&gt;_FF_0001.nii.gz</b> = FAT FRACTION
           </Typography>
 
-          {uploadError && <Typography sx={{ color: "#f87171", mb: 2 }}>{uploadError}</Typography>}
-          {uploadStatusText && <Typography sx={{ color: "#cbd5e1", mb: 2 }}>{uploadStatusText}</Typography>}
+          {uploadError && <Typography sx={{ color: C.danger, mb: 2 }}>{uploadError}</Typography>}
+          {uploadStatusText && <Typography sx={{ color: C.textMuted, mb: 2 }}>{uploadStatusText}</Typography>}
 
           <Box
             sx={{
-              border: "2px dashed #334155",
+              border: `2px dashed ${C.border}`,
               borderRadius: 2,
               p: 5,
               textAlign: "center",
-              bgcolor: "#0f172a",
+              bgcolor: C.surfaceInset,
               opacity: uploadBusy ? 0.6 : 1,
             }}
           >
-            <CloudUploadIcon sx={{ fontSize: 44, color: "#a78bfa" }} />
+            <CloudUploadIcon sx={{ fontSize: 44, color: C.accent }} />
             <Typography sx={{ mt: 1, mb: 2 }}>
               Select a folder. Subfolder names will become case names.
             </Typography>
@@ -589,7 +842,7 @@ export default function Cases() {
                 variant="outlined"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={uploadBusy}
-                sx={{ borderColor: "#475569", color: "#eaeef6", textTransform: "none" }}
+                sx={{ borderColor: C.border, color: C.text, textTransform: "none" }}
               >
                 Browse File(s)
               </Button>
@@ -598,7 +851,7 @@ export default function Cases() {
                 variant="outlined"
                 onClick={() => folderInputRef.current?.click()}
                 disabled={uploadBusy}
-                sx={{ borderColor: "#475569", color: "#eaeef6", textTransform: "none" }}
+                sx={{ borderColor: C.border, color: C.text, textTransform: "none" }}
               >
                 Select Folder (Parent)
               </Button>

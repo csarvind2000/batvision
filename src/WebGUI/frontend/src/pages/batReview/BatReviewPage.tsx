@@ -14,18 +14,12 @@ import { useNavigate, useParams } from "react-router-dom";
 import {
   Box,
   Button,
-  Chip,
   Divider,
   IconButton,
   Paper,
   Slider,
   Stack,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableRow,
+  CircularProgress,
   ToggleButton,
   ToggleButtonGroup,
   Tooltip,
@@ -35,14 +29,19 @@ import {
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import VisibilityIcon from "@mui/icons-material/Visibility";
 import VisibilityOffIcon from "@mui/icons-material/VisibilityOff";
-import EditIcon from "@mui/icons-material/Edit";
+import FormatColorFillIcon from "@mui/icons-material/FormatColorFill";
 import UndoIcon from "@mui/icons-material/Undo";
 import DeleteSweepIcon from "@mui/icons-material/DeleteSweep";
 import SaveIcon from "@mui/icons-material/Save";
 
+import GridViewIcon from "@mui/icons-material/GridView";
+
 import { apiBatReview, apiSaveBatAnnotation } from "../../api/client";
-import { useNiivue4Up, makeBatLut } from "./useNiivue4Up";
+import { useNiivue4Up, makeBatLut, VIEWS } from "./useNiivue4Up";
 import type { MaskType } from "./useNiivue4Up";
+import ViewerGrid, { LAYOUTS } from "./ViewerGrid";
+import type { LayoutMode } from "./ViewerGrid";
+import { C, BORDER as T_BORDER, toggleSx as themeToggleSx, panelSx, CLASS_COLORS } from "./theme";
 
 type ReviewPayload = {
   case?: {
@@ -91,16 +90,7 @@ type ReviewPayload = {
   };
 };
 
-const toggleSx = {
-  color: "#fff",
-  borderColor: "#1f2937",
-  bgcolor: "transparent",
-  "&.Mui-selected": { color: "#fff", bgcolor: "#1f2937" },
-  "&.Mui-disabled": {
-    color: "rgba(255,255,255,0.35)",
-    borderColor: "rgba(31,41,55,0.6)",
-  },
-};
+const toggleSx = themeToggleSx;
 
 type BaseImage = "fat" | "ff";
 type EditMode = "off" | "draw" | "erase";
@@ -115,23 +105,42 @@ function toNum(v: any): number | null {
   return null;
 }
 
-const BORDER = "1px solid #1f2937";
-const PANEL_BG = "#111827";
-const SUB_BG = "#0b1220";
-const MUTED_WHITE = { color: "rgba(255,255,255,0.78)" };
+const BORDER = T_BORDER;
 
 const MASK_BADGE: Record<MaskType, { tag: string; color: string }> = {
-  binary: { tag: "BAT", color: "#ff0000" },
-  c3: { tag: "C3", color: "#22c55e" },
-  c4: { tag: "C4", color: "#f59e0b" },
+  binary: { tag: "BAT", color: CLASS_COLORS[1] },
+  c3: { tag: "C3", color: CLASS_COLORS[2] },
+  c4: { tag: "C4", color: CLASS_COLORS[4] },
 };
 
 const CLASS_CHIPS = [
-  { label: "Class 1", color: "#ff0000", value: 1 },
-  { label: "Class 2", color: "#00ff00", value: 2 },
-  { label: "Class 3", color: "#0000ff", value: 3 },
-  { label: "Class 4", color: "#ffff00", value: 4 },
+  { label: "Class 1", color: CLASS_COLORS[1], value: 1 },
+  { label: "Class 2", color: CLASS_COLORS[2], value: 2 },
+  { label: "Class 3", color: CLASS_COLORS[3], value: 3 },
+  { label: "Class 4", color: CLASS_COLORS[4], value: 4 },
 ];
+
+/** Uppercase rule-and-label that separates the side-panel sections. */
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <Typography
+      sx={{
+        px: 2,
+        pt: 1.75,
+        pb: 1,
+        color: C.textFaint,
+        fontSize: 10.5,
+        fontWeight: 800,
+        letterSpacing: 0.9,
+        textTransform: "uppercase",
+        borderBottom: T_BORDER,
+        mb: 1.25,
+      }}
+    >
+      {children}
+    </Typography>
+  );
+}
 
 export default function BatReviewPage() {
   const params = useParams();
@@ -149,12 +158,24 @@ export default function BatReviewPage() {
 
   const [editMode, setEditMode] = useState<EditMode>("off");
   const [brushSize, setBrushSize] = useState(8);
+  // Filled pen: closing a contour in one drag fills its interior. On by
+  // default -- outlining a depot is the common action -- but switchable off for
+  // single-voxel touch-ups.
+  const [fillContour, setFillContour] = useState(true);
   const [activeLabel, setActiveLabel] = useState<number>(1);
 
   const [saving, setSaving] = useState(false);
 
+  // viewer layout; the pane index is which view "single" shows and which one
+  // the other layouts highlight
+  const [layout, setLayout] = useState<LayoutMode>("main3");
+  const [activePane, setActivePane] = useState(0);
+
   const {
     refs,
+    getViewers,
+    forceResizeAndDraw,
+    syncFrom,
     viewerOk,
     attachReady,
     loadBaseFromB64,
@@ -168,6 +189,11 @@ export default function BatReviewPage() {
   } = useNiivue4Up();
 
   const baseLoadGen = useRef(0);
+
+  // Show a segmentation as soon as one is available: opening a review to a bare
+  // greyscale image hides the very thing the page exists to show. Latched, so it
+  // happens once per base load and never fights a reviewer who hides the overlay.
+  const autoShowPendingRef = useRef(true);
 
   const getBaseInfo = useCallback((payload: ReviewPayload | null, chosen: BaseImage) => {
     const n = payload?.nifti || {};
@@ -261,11 +287,16 @@ export default function BatReviewPage() {
         await loadBaseFromB64({ b64, name });
 
         if (baseLoadGen.current === gen) {
-          // base changed => reset mask + tools
+          // base changed => reset mask + tools. The drawing is tied to the
+          // volume it was loaded against, so it has to be re-loaded rather
+          // than left in place.
           unloadMask();
           setDisplayedMask(null);
           setEditMode("off");
           setActiveLabel(1);
+          // re-arm the default overlay so switching Fat <-> Fat fraction does
+          // not silently leave the reviewer with no segmentation on screen
+          autoShowPendingRef.current = true;
         }
       } catch (e: any) {
         setErr(e?.message || "Failed to load base image");
@@ -282,13 +313,13 @@ export default function BatReviewPage() {
   // Apply edit settings whenever they change
   useEffect(() => {
     if (!displayedMask) {
-      applyEdit("off", brushSize, 1);
+      applyEdit("off", brushSize, 1, fillContour);
       return;
     }
 
     const effectiveLabel = displayedMask === "binary" ? 1 : Math.max(1, Math.min(4, activeLabel));
-    applyEdit(editMode, brushSize, effectiveLabel);
-  }, [displayedMask, editMode, brushSize, activeLabel, applyEdit]);
+    applyEdit(editMode, brushSize, effectiveLabel, fillContour);
+  }, [displayedMask, editMode, brushSize, activeLabel, fillContour, applyEdit]);
 
   // ✅ Single reliable toggle function (prevents double triggers)
   const toggleMask = useCallback(
@@ -365,6 +396,22 @@ export default function BatReviewPage() {
     ]
   );
 
+  // Auto-show the first available segmentation once the viewer and payload are
+  // both ready. Binary is the primary read-out; the class maps are the fallback
+  // if a case somehow lacks it.
+  useEffect(() => {
+    if (!autoShowPendingRef.current) return;
+    if (!raw || !viewerOk || !attachReady) return;
+    if (displayedMask) return;
+
+    const preferred: MaskType[] = ["binary", "c4", "c3"];
+    const first = preferred.find((m) => !!getMaskInfo(raw, m).b64);
+    if (!first) return;
+
+    autoShowPendingRef.current = false;
+    void toggleMask(first);
+  }, [raw, viewerOk, attachReady, displayedMask, getMaskInfo, toggleMask]);
+
   const doClearDrawing = useCallback(() => {
     try {
       unloadMask();
@@ -391,20 +438,47 @@ export default function BatReviewPage() {
             ? "mask_3class_edited.nii.gz"
             : "mask_4class_edited.nii.gz";
 
-      await apiSaveBatAnnotation(caseIdNum, {
+      // The endpoint returns the same shape as GET /bat-review/, already
+      // recomputed from the mask just saved. Dropping it on the floor was why
+      // the volumes never changed after a save.
+      const refreshed = (await apiSaveBatAnnotation(caseIdNum, {
         mask_type: displayedMask,
         filename,
         edited_mask_b64: edited_b64,
-      });
+      })) as ReviewPayload | undefined;
 
-      console.log("[BAT] save ok", { mask: displayedMask, filename, b64Len: edited_b64.length });
+      // The cached bytes are the pre-edit mask; keep them and the next toggle
+      // would quietly reload the old overlay over the new numbers.
+      clearMaskCache();
+
+      if (refreshed?.nifti) {
+        setRaw(refreshed);
+        const { b64, name } = getMaskInfo(refreshed, displayedMask);
+        if (b64) {
+          await loadMask({
+            key: `${caseIdNum}:${displayedMask}:${Date.now()}`,
+            opacity: maskOpacity,
+            lut: makeBatLut(displayedMask),
+            maskB64: b64,
+            name,
+          });
+        }
+      }
     } catch (e: any) {
       console.error(e);
       setErr(e?.message || "Save failed");
     } finally {
       setSaving(false);
     }
-  }, [displayedMask, caseIdNum, exportEditedMaskB64]);
+  }, [
+    displayedMask,
+    caseIdNum,
+    exportEditedMaskB64,
+    clearMaskCache,
+    getMaskInfo,
+    loadMask,
+    maskOpacity,
+  ]);
 
   const info = raw?.case || {};
   const vols = raw?.volumes || {};
@@ -427,219 +501,209 @@ export default function BatReviewPage() {
     []
   );
 
-  // Error page
-  if (err) {
+  // Only a load failure blocks the page. Errors raised later (a mask that will
+  // not load, a failed save) surface in the side panel instead, so one bad
+  // overlay never throws away a review already in progress.
+  if (err && !raw) {
     return (
-      <Box sx={{ minHeight: "100vh", bgcolor: "#0f1115", p: 2 }}>
-        <Button startIcon={<ArrowBackIcon />} onClick={() => navigate("/cases")} sx={{ color: "#fff" }}>
-          Back
+      <Box sx={{ height: "100vh", bgcolor: C.bg, p: 2 }}>
+        <Button
+          startIcon={<ArrowBackIcon />}
+          onClick={() => navigate("/cases")}
+          sx={{ color: C.textMuted, textTransform: "none" }}
+        >
+          Back to cases
         </Button>
-        <Typography sx={{ mt: 2, color: "#ff6b6b", whiteSpace: "pre-wrap" }}>{err}</Typography>
+        <Paper sx={{ ...panelSx, p: 2.5, mt: 2, maxWidth: 620, borderColor: C.danger }}>
+          <Typography sx={{ color: C.danger, fontWeight: 700, fontSize: 14, mb: 0.5 }}>
+            Could not open this review
+          </Typography>
+          <Typography sx={{ color: C.textMuted, fontSize: 13, whiteSpace: "pre-wrap" }}>
+            {err}
+          </Typography>
+        </Paper>
       </Box>
     );
   }
 
-  // Loading
   if (!raw) {
     return (
-      <Box sx={{ minHeight: "100vh", bgcolor: "#0f1115", p: 2 }}>
-        <Typography sx={{ color: "#fff" }}>Loading review…</Typography>
+      <Box sx={{ height: "100vh", bgcolor: C.bg, display: "grid", placeItems: "center" }}>
+        <Stack spacing={1.5} alignItems="center">
+          <CircularProgress size={26} sx={{ color: C.accent }} />
+          <Typography sx={{ color: C.textMuted, fontSize: 13 }}>Loading review…</Typography>
+        </Stack>
       </Box>
     );
   }
 
+  // Volumes exist as soon as the case is analysed, so the panel shows them
+  // whether or not an overlay happens to be switched on. Tying the numbers to
+  // the overlay toggle made the panel read as empty most of the time.
+  const totals: { key: MaskType; label: string; value: number | null }[] = [
+    { key: "binary", label: "Binary BAT", value: binaryTotal },
+    { key: "c3", label: "3-class total", value: c3Total },
+    { key: "c4", label: "4-class total", value: c4Total },
+  ];
+
+  const breakdown: { color: string; name: string; value: number | null }[] =
+    displayedMask === "c3"
+      ? [
+          { color: CLASS_COLORS[1], name: "Muscle", value: toNum(c3b.class1_muscle_ml) },
+          { color: CLASS_COLORS[2], name: "Brown fat", value: toNum(c3b.class2_brownfat_ml) },
+          { color: CLASS_COLORS[3], name: "Mix + white", value: toNum(c3b.class3_mixwhite_ml) },
+        ]
+      : displayedMask === "c4"
+        ? [
+            { color: CLASS_COLORS[1], name: "Muscle", value: toNum(c4b.class1_muscle_ml) },
+            { color: CLASS_COLORS[2], name: "Brown fat", value: toNum(c4b.class2_brownfat_ml) },
+            { color: CLASS_COLORS[3], name: "Mixed fat", value: toNum(c4b.class3_mixfat_ml) },
+            { color: CLASS_COLORS[4], name: "White fat", value: toNum(c4b.class4_whitefat_ml) },
+          ]
+        : [];
+
+  const breakdownTotal = displayedMask === "c3" ? c3Total : c4Total;
+
   return (
-    <Box sx={{ minHeight: "100vh", bgcolor: "#0f1115", p: 2 }}>
-      <Paper sx={{ bgcolor: PANEL_BG, border: BORDER, borderRadius: 2, p: 2, mb: 2 }}>
-        <Stack direction="row" spacing={2} alignItems="center">
-          <Button startIcon={<ArrowBackIcon />} onClick={() => navigate("/cases")} sx={{ color: "#fff" }}>
-            Back
-          </Button>
-          <Typography sx={{ color: "#fff", fontWeight: 900 }}>BAT Review</Typography>
-          <Divider orientation="vertical" flexItem sx={{ borderColor: "#1f2937" }} />
-          <Typography sx={MUTED_WHITE}>Patient: {info.patientName ?? "-"}</Typography>
-          <Typography sx={MUTED_WHITE}>ID: {info.patientId ?? "-"}</Typography>
-          <Box sx={{ flex: 1 }} />
-          <Typography sx={{ color: "#a78bfa", fontWeight: 900 }}>{info.seriesType ?? "BAT"}</Typography>
-        </Stack>
-      </Paper>
+    <Box
+      sx={{
+        height: "100vh",
+        bgcolor: C.bg,
+        p: 2,
+        display: "flex",
+        flexDirection: "column",
+        gap: 1.5,
+      }}
+    >
+      {/* ── header ─────────────────────────────────────────────────────── */}
+      <Stack direction="row" spacing={1.5} alignItems="center">
+        <Tooltip title="Back to cases">
+          <IconButton onClick={() => navigate("/cases")} sx={{ color: C.textMuted }}>
+            <ArrowBackIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
 
-      <Stack direction="row" spacing={2} sx={{ height: "calc(100vh - 120px)" }}>
-        {/* Left */}
-        <Paper sx={{ width: 380, bgcolor: PANEL_BG, border: BORDER, borderRadius: 2, overflow: "hidden" }}>
-          <Box sx={{ p: 2, borderBottom: BORDER }}>
-            <Stack direction="row" alignItems="center" justifyContent="space-between">
-              <Typography sx={{ color: "#fff", fontWeight: 900 }}>Segmentations</Typography>
+        <Box>
+          <Typography sx={{ color: C.text, fontWeight: 800, fontSize: 17, lineHeight: 1.2 }}>
+            {info.patientId ?? info.patientName ?? "—"}
+          </Typography>
+          <Typography sx={{ color: C.textFaint, fontSize: 11.5 }}>
+            {info.seriesType ?? "BAT"} review
+            {info.status ? ` · ${String(info.status).toLowerCase()}` : ""}
+          </Typography>
+        </Box>
 
-              <Stack direction="row" spacing={1}>
-                <Tooltip title="Toggle edit tools">
-                  <span>
-                    <Button
-                      size="small"
-                      variant="contained"
-                      startIcon={<EditIcon />}
-                      disabled={!displayedMask}
-                      onClick={() => setEditMode((m) => (m === "off" ? "draw" : "off"))}
-                      sx={{ bgcolor: "#6d28d9", "&:hover": { bgcolor: "#5b21b6" }, color: "#fff" }}
-                    >
-                      Edit
-                    </Button>
-                  </span>
-                </Tooltip>
+        <Box sx={{ flex: 1 }} />
+      </Stack>
 
-                <Tooltip title="Save edited mask">
-                  <span>
-                    <Button
-                      size="small"
-                      variant="contained"
-                      startIcon={<SaveIcon />}
-                      disabled={!displayedMask || saving}
-                      onClick={doSave}
-                      sx={{ bgcolor: "#059669", "&:hover": { bgcolor: "#047857" }, color: "#fff" }}
-                    >
-                      Save
-                    </Button>
-                  </span>
-                </Tooltip>
-              </Stack>
-            </Stack>
-
-            <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 2 }}>
-              <Typography sx={{ color: "rgba(255,255,255,0.75)", fontSize: 12, minWidth: 48 }}>
-                Base:
-              </Typography>
-              <ToggleButtonGroup exclusive value={baseImg} onChange={(_, v) => v && setBaseImg(v)} size="small">
-                <ToggleButton value="fat" sx={toggleSx}>FAT</ToggleButton>
-                <ToggleButton value="ff" sx={toggleSx} disabled={!hasFF}>FAT FRACTION</ToggleButton>
-              </ToggleButtonGroup>
-            </Stack>
+      <Stack direction="row" spacing={1.5} sx={{ flex: 1, minHeight: 0 }}>
+        {/* ── left panel ───────────────────────────────────────────────── */}
+        <Paper
+          sx={{
+            ...panelSx,
+            width: 320,
+            flexShrink: 0,
+            overflowY: "auto",
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          <SectionLabel>Segmentations</SectionLabel>
+          <Box sx={{ px: 1.5, pb: 1.5 }}>
+            {segs.map((seg) => {
+              const on = displayedMask === seg.key;
+              const badge = MASK_BADGE[seg.key];
+              const total = totals.find((t) => t.key === seg.key)?.value ?? null;
+              return (
+                <Stack
+                  key={seg.key}
+                  direction="row"
+                  alignItems="center"
+                  spacing={1}
+                  sx={{
+                    py: 0.75,
+                    px: 1,
+                    borderRadius: 1.5,
+                    cursor: "pointer",
+                    bgcolor: on ? "rgba(124,156,245,0.10)" : "transparent",
+                    "&:hover": { bgcolor: "rgba(124,156,245,0.06)" },
+                  }}
+                  onClick={() => (viewerOk && attachReady ? toggleMask(seg.key) : undefined)}
+                >
+                  <Box
+                    sx={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      bgcolor: badge.color,
+                      flexShrink: 0,
+                    }}
+                  />
+                  <Typography sx={{ color: C.text, fontSize: 13, fontWeight: 600, flex: 1 }}>
+                    {seg.label}
+                  </Typography>
+                  <Typography
+                    sx={{
+                      color: on ? C.text : C.textFaint,
+                      fontSize: 12,
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    {total !== null ? `${total.toFixed(1)} mL` : "—"}
+                  </Typography>
+                  {/* Visibility is an eye, not a switch: it reads as "showing /
+                      not showing" rather than "enabled / disabled". */}
+                  <Tooltip title={on ? "Hide overlay" : "Show overlay"}>
+                    <span>
+                      <IconButton
+                        size="small"
+                        disabled={!viewerOk || !attachReady}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleMask(seg.key);
+                        }}
+                        sx={{
+                          color: on ? C.accent : C.textFaint,
+                          "&:hover": { color: on ? C.accent : C.textMuted },
+                        }}
+                      >
+                        {on ? (
+                          <VisibilityIcon sx={{ fontSize: 18 }} />
+                        ) : (
+                          <VisibilityOffIcon sx={{ fontSize: 18 }} />
+                        )}
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                </Stack>
+              );
+            })}
 
             {viewerOk && !attachReady && (
-              <Typography sx={{ mt: 1, color: "#fbbf24", fontSize: 12 }}>Viewer initializing…</Typography>
+              <Typography sx={{ color: C.warn, fontSize: 11.5, mt: 1 }}>
+                Viewer initialising…
+              </Typography>
             )}
             {!viewerOk && (
-              <Typography sx={{ mt: 1, color: "#fbbf24", fontSize: 12 }}>WebGL not available</Typography>
+              <Typography sx={{ color: C.warn, fontSize: 11.5, mt: 1 }}>
+                WebGL not available in this browser.
+              </Typography>
+            )}
+            {err && (
+              <Typography sx={{ color: C.danger, fontSize: 11.5, mt: 1, whiteSpace: "pre-wrap" }}>
+                {err}
+              </Typography>
             )}
           </Box>
 
-          {/* Seg list */}
-          <TableContainer sx={{ borderBottom: BORDER }}>
-            <Table size="small">
-              <TableBody>
-                {segs.map((s, idx) => {
-                  const checked = displayedMask === s.key;
-                  const badge = MASK_BADGE[s.key];
-
-                  return (
-                    <TableRow key={s.key} sx={{ "& td": { borderBottom: BORDER, py: 1 } }}>
-                      <TableCell sx={{ width: 32, color: "rgba(255,255,255,0.75)", fontSize: 12 }}>
-                        {idx + 1}
-                      </TableCell>
-
-                      <TableCell sx={{ px: 1 }}>
-                        <Stack direction="row" spacing={1} alignItems="center">
-                          <Chip
-                            label={badge.tag}
-                            size="small"
-                            sx={{
-                              bgcolor: "transparent",
-                              border: `1px solid ${badge.color}`,
-                              color: badge.color,
-                              fontWeight: 900,
-                              height: 22,
-                            }}
-                          />
-                          <Box sx={{ lineHeight: 1.1 }}>
-                            <Typography sx={{ color: "#fff", fontSize: 13, fontWeight: 800 }}>
-                              {s.label}
-                            </Typography>
-                            <Typography sx={{ color: "rgba(255,255,255,0.72)", fontSize: 12 }}>
-                              {s.sub}
-                            </Typography>
-                          </Box>
-                        </Stack>
-                      </TableCell>
-
-                      <TableCell align="right" sx={{ width: 92, pr: 1 }}>
-                        <Tooltip title={checked ? "Hide" : "Show"}>
-                          <span>
-                            <IconButton
-                              size="small"
-                              onClick={() => toggleMask(s.key)}
-                              sx={{ color: "#fff" }}
-                              disabled={!viewerOk || !attachReady}
-                            >
-                              {checked ? <VisibilityIcon fontSize="small" /> : <VisibilityOffIcon fontSize="small" />}
-                            </IconButton>
-                          </span>
-                        </Tooltip>
-
-                        <Switch
-                          size="small"
-                          checked={checked}
-                          onChange={() => toggleMask(s.key)}
-                          disabled={!viewerOk || !attachReady}
-                        />
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
-          </TableContainer>
-
-          {/* Tools */}
-          <Box sx={{ p: 2, borderBottom: BORDER }}>
-            <Typography sx={{ color: "rgba(255,255,255,0.75)", fontSize: 12, mb: 1 }}>Tools</Typography>
-
-            <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-              <ToggleButtonGroup
-                exclusive
-                value={editMode}
-                onChange={(_, v) => setEditMode((v || "off") as EditMode)}
-                size="small"
-                disabled={!displayedMask}
-              >
-                <ToggleButton value="off" sx={toggleSx}>OFF</ToggleButton>
-                <ToggleButton value="draw" sx={toggleSx}>…DRAW</ToggleButton>
-                <ToggleButton value="erase" sx={toggleSx}>…ERASE</ToggleButton>
-              </ToggleButtonGroup>
-
-              <Tooltip title="Undo">
-                <span>
-                  <IconButton size="small" sx={{ color: "#fff" }} disabled={!displayedMask} onClick={undo}>
-                    <UndoIcon fontSize="small" />
-                  </IconButton>
-                </span>
-              </Tooltip>
-
-              <Tooltip title="Clear overlay">
-                <span>
-                  <IconButton size="small" sx={{ color: "#fff" }} disabled={!displayedMask} onClick={doClearDrawing}>
-                    <DeleteSweepIcon fontSize="small" />
-                  </IconButton>
-                </span>
-              </Tooltip>
+          <SectionLabel>Overlay</SectionLabel>
+          <Box sx={{ px: 2, pb: 2 }}>
+            <Stack direction="row" justifyContent="space-between" sx={{ mb: 0.5 }}>
+              <Typography sx={{ color: C.textMuted, fontSize: 12 }}>Opacity</Typography>
+              <Typography sx={{ color: C.textFaint, fontSize: 12, fontVariantNumeric: "tabular-nums" }}>
+                {(maskOpacity * 100).toFixed(0)}%
+              </Typography>
             </Stack>
-
-            {/* Brush */}
-            <Typography sx={{ color: "rgba(255,255,255,0.75)", fontSize: 12, mt: 2 }}>
-              Brush Size
-            </Typography>
-            <Slider
-              min={1}
-              max={40}
-              step={1}
-              value={brushSize}
-              onChange={(_, v) => setBrushSize(v as number)}
-              disabled={!displayedMask}
-              size="small"
-            />
-
-            {/* Opacity */}
-            <Typography sx={{ color: "rgba(255,255,255,0.75)", fontSize: 12, mt: 1 }}>
-              Opacity: {(maskOpacity * 100).toFixed(0)}%
-            </Typography>
             <Slider
               min={0}
               max={1}
@@ -648,188 +712,307 @@ export default function BatReviewPage() {
               onChange={(_, v) => setMaskOpacityLocal(v as number)}
               disabled={!displayedMask}
               size="small"
+              sx={{ color: C.accent }}
             />
-
-            {/* Color palette / label selection */}
-            <Typography sx={{ color: "rgba(255,255,255,0.75)", fontSize: 12, mt: 2 }}>
-              Label / Color
-            </Typography>
-
-            <Stack direction="row" spacing={1} flexWrap="wrap" sx={{ mt: 1 }}>
-              {displayedMask === "binary" ? (
-                <Chip
-                  label="Binary (Class 1 - Red)"
-                  size="small"
-                  sx={{ bgcolor: "transparent", border: "1px solid #ff0000", color: "#fff" }}
-                />
-              ) : (
-                CLASS_CHIPS
-                  .filter((c) => (displayedMask === "c3" ? c.value <= 3 : true))
-                  .map((c) => (
-                    <Chip
-                      key={c.value}
-                      onClick={() => setActiveLabel(c.value)}
-                      label={c.label}
-                      size="small"
-                      sx={{
-                        cursor: "pointer",
-                        bgcolor: activeLabel === c.value ? "rgba(255,255,255,0.12)" : "transparent",
-                        border: `1px solid ${c.color}`,
-                        color: "#fff",
-                        "&:hover": { bgcolor: "rgba(255,255,255,0.10)" },
-                      }}
-                      icon={
-                        <span
-                          style={{
-                            width: 10,
-                            height: 10,
-                            borderRadius: 2,
-                            background: c.color,
-                            display: "inline-block",
-                            marginLeft: 6,
-                          }}
-                        />
-                      }
-                    />
-                  ))
-              )}
-            </Stack>
           </Box>
 
-          {/* Results */}
-          <Box sx={{ p: 2 }}>
-            <Typography sx={{ color: "#fff", fontWeight: 900, mb: 1 }}>Results</Typography>
+          <SectionLabel>Editing</SectionLabel>
+          <Box sx={{ px: 2, pb: 2 }}>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <ToggleButtonGroup
+                exclusive
+                size="small"
+                value={editMode}
+                onChange={(_, v) => setEditMode((v || "off") as EditMode)}
+                disabled={!displayedMask}
+              >
+                <ToggleButton value="off" sx={toggleSx}>Off</ToggleButton>
+                <ToggleButton value="draw" sx={toggleSx}>Draw</ToggleButton>
+                <ToggleButton value="erase" sx={toggleSx}>Erase</ToggleButton>
+              </ToggleButtonGroup>
 
-            <TableContainer component={Paper} sx={{ bgcolor: SUB_BG, border: BORDER }}>
-              <Table size="small">
-                <TableBody>
-                  {displayedMask === "binary" && (
-                    <>
-                      <ResRow name="BAT (Binary)" val={binaryTotal} />
-                      <ResRow name="Total" val={binaryTotal} isBold />
-                    </>
-                  )}
+              <Tooltip title="Fill closed contours as you draw">
+                <span>
+                  <ToggleButton
+                    value="fill"
+                    size="small"
+                    selected={fillContour}
+                    disabled={!displayedMask || editMode === "off"}
+                    onChange={() => setFillContour((f) => !f)}
+                    sx={{ ...toggleSx, ml: 1, px: 1 }}
+                  >
+                    <FormatColorFillIcon sx={{ fontSize: 16 }} />
+                  </ToggleButton>
+                </span>
+              </Tooltip>
 
-                  {displayedMask === "c3" && (
-                    <>
-                      <ResRow name="Class 1 (Muscle)" val={toNum(c3b.class1_muscle_ml)} />
-                      <ResRow name="Class 2 (Brown Fat)" val={toNum(c3b.class2_brownfat_ml)} />
-                      <ResRow name="Class 3 (Mix+White)" val={toNum(c3b.class3_mixwhite_ml)} />
-                      <ResRow name="Total" val={c3Total} isBold />
-                    </>
-                  )}
+              <Box sx={{ flex: 1 }} />
 
-                  {displayedMask === "c4" && (
-                    <>
-                      <ResRow name="Class 1 (Muscle)" val={toNum(c4b.class1_muscle_ml)} />
-                      <ResRow name="Class 2 (Brown Fat)" val={toNum(c4b.class2_brownfat_ml)} />
-                      <ResRow name="Class 3 (Mix Fat)" val={toNum(c4b.class3_mixfat_ml)} />
-                      <ResRow name="Class 4 (White Fat)" val={toNum(c4b.class4_whitefat_ml)} />
-                      <ResRow name="Total" val={c4Total} isBold />
-                    </>
-                  )}
+              <Tooltip title="Undo last stroke">
+                <span>
+                  <IconButton
+                    size="small"
+                    disabled={!displayedMask}
+                    onClick={undo}
+                    sx={{ color: C.textMuted, "&:hover": { color: C.text } }}
+                  >
+                    <UndoIcon sx={{ fontSize: 17 }} />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <Tooltip title="Remove the overlay">
+                <span>
+                  <IconButton
+                    size="small"
+                    disabled={!displayedMask}
+                    onClick={doClearDrawing}
+                    sx={{ color: C.textMuted, "&:hover": { color: C.danger } }}
+                  >
+                    <DeleteSweepIcon sx={{ fontSize: 17 }} />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            </Stack>
 
-                  {!displayedMask && (
-                    <TableRow>
-                      <TableCell colSpan={2} sx={{ color: "rgba(255,255,255,0.65)", fontSize: 12 }}>
-                        Select a segmentation to view volumes.
-                      </TableCell>
-                    </TableRow>
+            <Stack direction="row" justifyContent="space-between" sx={{ mt: 1.5, mb: 0.5 }}>
+              <Typography sx={{ color: C.textMuted, fontSize: 12 }}>Brush</Typography>
+              <Typography sx={{ color: C.textFaint, fontSize: 12, fontVariantNumeric: "tabular-nums" }}>
+                {brushSize} px
+              </Typography>
+            </Stack>
+            <Slider
+              min={1}
+              max={40}
+              step={1}
+              value={brushSize}
+              onChange={(_, v) => setBrushSize(v as number)}
+              disabled={!displayedMask || editMode === "off"}
+              size="small"
+              sx={{ color: C.accent }}
+            />
+
+            {/* Label picker only exists for the multi-class masks; a binary mask
+                has exactly one label, so offering four was a false choice. */}
+            {displayedMask && displayedMask !== "binary" && (
+              <>
+                <Typography sx={{ color: C.textMuted, fontSize: 12, mt: 1, mb: 0.75 }}>
+                  Paint as
+                </Typography>
+                <Stack direction="row" spacing={0.75}>
+                  {CLASS_CHIPS.filter((c) => (displayedMask === "c3" ? c.value <= 3 : true)).map(
+                    (c) => {
+                      const active = activeLabel === c.value;
+                      return (
+                        <Box
+                          key={c.value}
+                          onClick={() => setActiveLabel(c.value)}
+                          sx={{
+                            cursor: "pointer",
+                            flex: 1,
+                            textAlign: "center",
+                            py: 0.5,
+                            borderRadius: 1,
+                            border: "1px solid",
+                            borderColor: active ? c.color : C.border,
+                            bgcolor: active ? `${c.color}22` : "transparent",
+                          }}
+                        >
+                          <Box
+                            sx={{
+                              width: 10,
+                              height: 10,
+                              borderRadius: 0.5,
+                              bgcolor: c.color,
+                              mx: "auto",
+                            }}
+                          />
+                          <Typography sx={{ color: C.textMuted, fontSize: 10.5, mt: 0.25 }}>
+                            {c.value}
+                          </Typography>
+                        </Box>
+                      );
+                    }
                   )}
-                </TableBody>
-              </Table>
-            </TableContainer>
+                </Stack>
+              </>
+            )}
+            {/* Saving belongs with the tools that produce the edit, not in a
+                header on the far side of the window. */}
+            <Tooltip title={displayedMask ? "" : "Show a segmentation first"}>
+              <span>
+                <Button
+                  fullWidth
+                  size="small"
+                  variant="contained"
+                  startIcon={<SaveIcon />}
+                  disabled={!displayedMask || saving}
+                  onClick={doSave}
+                  sx={{
+                    mt: 2,
+                    bgcolor: C.accentDim,
+                    textTransform: "none",
+                    fontWeight: 600,
+                    "&:hover": { bgcolor: C.accent },
+                    "&.Mui-disabled": { bgcolor: C.surfaceInset, color: C.textFaint },
+                  }}
+                >
+                  {saving ? "Saving…" : "Save annotation"}
+                </Button>
+              </span>
+            </Tooltip>
+          </Box>
+
+          <SectionLabel>Volumes</SectionLabel>
+          <Box sx={{ px: 2, pb: 2 }}>
+            {totals.map((t) => (
+              <Stack
+                key={t.key}
+                direction="row"
+                justifyContent="space-between"
+                sx={{ py: 0.5, borderBottom: BORDER }}
+              >
+                <Typography
+                  sx={{
+                    color: displayedMask === t.key ? C.text : C.textMuted,
+                    fontSize: 12.5,
+                    fontWeight: displayedMask === t.key ? 700 : 400,
+                  }}
+                >
+                  {t.label}
+                </Typography>
+                <Typography
+                  sx={{ color: C.text, fontSize: 12.5, fontVariantNumeric: "tabular-nums" }}
+                >
+                  {t.value !== null ? `${t.value.toFixed(2)} mL` : "—"}
+                </Typography>
+              </Stack>
+            ))}
+
+            {breakdown.length > 0 && (
+              <Box sx={{ mt: 1.5 }}>
+                <Typography sx={{ color: C.textFaint, fontSize: 11, mb: 0.5 }}>
+                  {displayedMask === "c3" ? "3-class" : "4-class"} breakdown
+                </Typography>
+                {breakdown.map((b) => {
+                  const pct =
+                    b.value !== null && breakdownTotal
+                      ? (b.value / breakdownTotal) * 100
+                      : null;
+                  return (
+                    <Stack
+                      key={b.name}
+                      direction="row"
+                      alignItems="center"
+                      spacing={1}
+                      sx={{ py: 0.4 }}
+                    >
+                      <Box
+                        sx={{ width: 8, height: 8, borderRadius: 0.5, bgcolor: b.color, flexShrink: 0 }}
+                      />
+                      <Typography sx={{ color: C.textMuted, fontSize: 12, flex: 1 }}>
+                        {b.name}
+                      </Typography>
+                      <Typography
+                        sx={{ color: C.textFaint, fontSize: 11, fontVariantNumeric: "tabular-nums", width: 42, textAlign: "right" }}
+                      >
+                        {pct !== null ? `${pct.toFixed(0)}%` : ""}
+                      </Typography>
+                      <Typography
+                        sx={{ color: C.text, fontSize: 12, fontVariantNumeric: "tabular-nums", width: 62, textAlign: "right" }}
+                      >
+                        {b.value !== null ? `${b.value.toFixed(2)} mL` : "—"}
+                      </Typography>
+                    </Stack>
+                  );
+                })}
+              </Box>
+            )}
           </Box>
         </Paper>
 
-        {/* Right: 4 views */}
-        <Box
-          sx={{
-            flex: 1,
-            minWidth: 0,
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr",
-            gridTemplateRows: "1fr 1fr",
-            gap: 2,
-          }}
-        >
-          <ViewerCard title="Axial" canvasRef={refs.axialRef} disabled={!viewerOk} />
-          <ViewerCard title="3D" canvasRef={refs.render3DRef} disabled={!viewerOk} />
-          <ViewerCard title="Sagittal" canvasRef={refs.sagittalRef} disabled={!viewerOk} />
-          <ViewerCard title="Coronal" canvasRef={refs.coronalRef} disabled={!viewerOk} />
+        {/* Right: viewer toolbar + panes */}
+        <Box sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 1 }}>
+          <Paper sx={{ ...panelSx, px: 1, py: 0.75 }}>
+            <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap" useFlexGap>
+              {/* base image — a viewer control, so it lives with the viewer */}
+              <Stack direction="row" spacing={0.75} alignItems="center">
+                <Typography sx={{ color: C.textFaint, fontSize: 11, fontWeight: 700, letterSpacing: 0.6 }}>
+                  BASE
+                </Typography>
+                <ToggleButtonGroup
+                  exclusive
+                  size="small"
+                  value={baseImg}
+                  onChange={(_, v) => v && setBaseImg(v)}
+                >
+                  <ToggleButton value="fat" sx={toggleSx}>Fat</ToggleButton>
+                  <Tooltip title={hasFF ? "" : "This case has no fat-fraction volume"}>
+                    <span>
+                      <ToggleButton value="ff" sx={toggleSx} disabled={!hasFF}>
+                        Fat fraction
+                      </ToggleButton>
+                    </span>
+                  </Tooltip>
+                </ToggleButtonGroup>
+              </Stack>
+
+              <Divider orientation="vertical" flexItem sx={{ borderColor: C.border }} />
+
+              {/* layout */}
+              <Stack direction="row" spacing={0.75} alignItems="center">
+                <GridViewIcon sx={{ fontSize: 15, color: C.textFaint }} />
+                <ToggleButtonGroup
+                  exclusive
+                  size="small"
+                  value={layout}
+                  onChange={(_, v) => v && setLayout(v as LayoutMode)}
+                >
+                  {LAYOUTS.map((l) => (
+                    <Tooltip key={l.mode} title={l.hint}>
+                      <ToggleButton value={l.mode} sx={toggleSx}>
+                        {l.label}
+                      </ToggleButton>
+                    </Tooltip>
+                  ))}
+                </ToggleButtonGroup>
+              </Stack>
+
+              <Divider orientation="vertical" flexItem sx={{ borderColor: C.border }} />
+
+              {/* which pane "1" shows, and which pane is highlighted elsewhere */}
+              <ToggleButtonGroup
+                exclusive
+                size="small"
+                value={activePane}
+                onChange={(_, v) => v !== null && setActivePane(v as number)}
+              >
+                {VIEWS.map((v, i) => (
+                  <ToggleButton key={v.key} value={i} sx={toggleSx}>
+                    {v.short}
+                  </ToggleButton>
+                ))}
+              </ToggleButtonGroup>
+
+              <Box sx={{ flex: 1 }} />
+              <Typography sx={{ color: C.textFaint, fontSize: 11 }}>
+                double-click a pane to expand · drag or scroll to move the crosshair
+              </Typography>
+            </Stack>
+          </Paper>
+
+          <ViewerGrid
+            refs={refs}
+            getViewers={getViewers}
+            forceResizeAndDraw={forceResizeAndDraw}
+            syncFrom={syncFrom}
+            layout={layout}
+            viewerOk={viewerOk}
+            ready={attachReady}
+            activePane={activePane}
+            onActivePaneChange={setActivePane}
+          />
         </Box>
       </Stack>
     </Box>
-  );
-}
-
-function ResRow({ name, val, isBold }: { name: string; val: number | null; isBold?: boolean }) {
-  return (
-    <TableRow>
-      <TableCell sx={{ color: "#fff", fontSize: 12, borderBottom: "1px solid #1f2937" }}>
-        {name}
-      </TableCell>
-      <TableCell
-        align="right"
-        sx={{
-          color: "#fff",
-          fontSize: 12,
-          fontWeight: isBold ? 900 : 700,
-          borderBottom: "1px solid #1f2937",
-          whiteSpace: "nowrap",
-        }}
-      >
-        {val !== null ? `${val.toFixed(2)} ml` : "-"}
-      </TableCell>
-    </TableRow>
-  );
-}
-
-function ViewerCard({
-  title,
-  canvasRef,
-  disabled,
-}: {
-  title: string;
-  canvasRef: any;
-  disabled: boolean;
-}) {
-  return (
-    <Paper
-      elevation={0}
-      sx={{
-        bgcolor: "#111827",
-        border: "1px solid #1f2937",
-        borderRadius: 2,
-        overflow: "hidden",
-        display: "flex",
-        flexDirection: "column",
-        minHeight: 0,
-      }}
-    >
-      <Box sx={{ p: 1, borderBottom: "1px solid #1f2937" }}>
-        <Typography sx={{ color: "#fff", fontWeight: 900 }}>{title}</Typography>
-      </Box>
-
-      <Box sx={{ flex: 1, minHeight: 0, position: "relative" }}>
-        <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
-
-        {disabled && (
-          <Box
-            sx={{
-              position: "absolute",
-              inset: 0,
-              display: "grid",
-              placeItems: "center",
-              pointerEvents: "none",
-            }}
-          >
-            <Typography sx={{ color: "rgba(255,255,255,0.7)", fontSize: 13 }}>
-              WebGL not available
-            </Typography>
-          </Box>
-        )}
-      </Box>
-    </Paper>
   );
 }

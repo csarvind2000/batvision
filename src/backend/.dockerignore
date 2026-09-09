@@ -1,0 +1,17 @@
+**/__pycache__/
+**/*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# local dev database — never bake it into an image
+db.sqlite3
+*.sqlite3
+
+# TypeScript helpers that belong to the frontend, not the Django app
+**/*.ts
+
+.env
+.env.*
+media/
+staticfiles/
+storage/

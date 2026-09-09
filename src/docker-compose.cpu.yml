@@ -1,0 +1,20 @@
+###############################################################################
+# Run the AI service without a GPU.
+#
+#     docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+#
+# A 3D full-resolution nnU-Net prediction on CPU takes tens of minutes per case.
+# This is for smoke-testing the wiring on a machine with no NVIDIA runtime, not
+# for production use.
+###############################################################################
+services:
+  ai:
+    environment:
+      BATAI_DEVICE: cpu
+      BATAI_DISABLE_TTA: "1"
+    deploy:
+      resources:
+        reservations:
+          # !override drops the base file's GPU reservation; a plain empty list
+          # would be appended to it and change nothing (needs Compose >= 2.24).
+          devices: !override []

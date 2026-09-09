@@ -1,142 +1,208 @@
-# docker-compose.yml
+###############################################################################
+# BATVision — brown adipose tissue segmentation & review platform
+#
+#   docker compose up -d --build          dev  (docker-compose.override.yml is
+#                                              picked up automatically: bind
+#                                              mounts, hot reload, runserver)
+#   docker compose -f docker-compose.yml up -d --build
+#                                         prod (gunicorn + nginx, no bind mounts)
+#
+# Every service is named batvision-<role>; images are tagged batvision/<role>.
+# Configuration comes from .env — start from .env.example.
+###############################################################################
+name: batvision
+
+x-build-args: &build-args
+  # containers run unprivileged; this UID must own BAT_DATA_HOST_DIR
+  APP_UID: ${APP_UID:-1000}
+  APP_GID: ${APP_GID:-1000}
+
+x-django-env: &django-env
+  DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY in .env}
+  DJANGO_DEBUG: ${DJANGO_DEBUG:-0}
+  DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,backend}
+  DJANGO_CORS_ALLOWED_ORIGINS: ${DJANGO_CORS_ALLOWED_ORIGINS:-http://localhost:5173}
+  DATABASE_URL: ${DATABASE_URL:-postgres://bfit:bfit@db:5432/bfit}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+  CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+  MEDIA_ROOT: ${MEDIA_ROOT:-/BAT_DataFolder/media}
+  OUTPUT_ROOT: ${OUTPUT_ROOT:-/storage/bat_outputs}
+  AI_BASE_URL: ${AI_BASE_URL:-http://ai:9000}
+  AI_INFER_PATH: ${AI_INFER_PATH:-/infer}
+  # blank = let the AI service use its own default model (AGB-Net)
+  AI_MODEL: ${AI_MODEL:-}
+  AI_TIMEOUT_S: ${AI_TIMEOUT_S:-3600}
+
+x-django-volumes: &django-volumes
+  - ${BAT_DATA_HOST_DIR:?set BAT_DATA_HOST_DIR in .env}:/BAT_DataFolder
+  - ${BAT_DATA_HOST_DIR}/output:/storage/bat_outputs
+
+x-restart: &restart unless-stopped
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
+  # ------------------------------------------------------------------ data --
   db:
-    image: postgres:16
-    container_name: bat-db
-    restart: unless-stopped
+    image: postgres:16-alpine
+    container_name: batvision-db
+    restart: *restart
+    logging: *logging
     environment:
-      POSTGRES_DB: bfit
-      POSTGRES_USER: bfit
-      POSTGRES_PASSWORD: bfit
+      POSTGRES_DB: ${POSTGRES_DB:-bfit}
+      POSTGRES_USER: ${POSTGRES_USER:-bfit}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - batvision-pgdata:/var/lib/postgresql/data
     ports:
-      - "5433:5432" # host 5433 -> container 5432 (avoids conflict)
+      - "${POSTGRES_HOST_PORT:-5433}:5432"   # 5433 on the host avoids a clash
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bfit} -d ${POSTGRES_DB:-bfit}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   redis:
-    image: redis:7
-    container_name: bat-redis
-    restart: unless-stopped
+    image: redis:7-alpine
+    container_name: batvision-redis
+    restart: *restart
+    logging: *logging
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - batvision-redis:/data
     ports:
-      - "6379:6379"
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
 
+  # --------------------------------------------------------------- ai/model --
   ai:
     build:
       context: ./ai
-    container_name: bat-ai
-    restart: unless-stopped
-    command: python app.py
+      target: runtime
+      args: *build-args
+    image: batvision/ai:${BATVISION_TAG:-latest}
+    container_name: batvision-ai
+    restart: *restart
+    logging: *logging
     environment:
-      - DEBUG_MODE=true
-
-      # ✅ unify output path with backend/worker logs: /storage/bat_outputs/<case_id>/*
-      - BAT_OUT_BASE=/storage/bat_outputs
-
-      # nnUNet env (adjust if needed)
-      - NNUNET_BASE=/app
-      - NNUNET_DATASET_ID=901
-      - NNUNET_CONFIG=3d_fullres
-      - NNUNET_TRAINER=nnUNetTrainerTopK10Loss_33os_1000epochs
-      - NNUNET_PLANS=nnUNetPlans
-      - NNUNET_FOLDS=0
+      # "agbnet" (default) or "baseline" — see ai/batai/config.py
+      BATAI_MODEL: ${BATAI_MODEL:-agbnet}
+      BATAI_DEVICE: ${BATAI_DEVICE:-cuda}
+      BATAI_OUT_BASE: /storage/bat_outputs
+      BATAI_DISABLE_TTA: ${BATAI_DISABLE_TTA:-0}
+      BATAI_DEBUG: ${BATAI_DEBUG:-0}
+      # keep the per-case working directory after a run, for debugging
+      BATAI_KEEP_WORKDIR: ${BATAI_KEEP_WORKDIR:-0}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     volumes:
-      - ./ai:/app
-
-      # inputs + shared data folder
+      # trained weights, read-only: <host>/DatasetXXX_.../<trainer>__<plans>__<config>
+      - ${BAT_MODELS_HOST_DIR:?set BAT_MODELS_HOST_DIR in .env}:/models/nnunet_results:ro
       - ${BAT_DATA_HOST_DIR}:/BAT_DataFolder
-
-      # ✅ persist outputs on host
       - ${BAT_DATA_HOST_DIR}/output:/storage/bat_outputs
-
-      # temp
-      - ai_tmp:/app/tmp
+      - batvision-ai-tmp:/tmp/batai
     ports:
-      - "9000:9000"
+      - "${AI_HOST_PORT:-9000}:9000"
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
+  # ------------------------------------------------------------------ app ----
   backend:
     build:
       context: ./backend
-    container_name: bat-backend
-    restart: unless-stopped
+      target: runtime
+      args: *build-args
+    image: batvision/backend:${BATVISION_TAG:-latest}
+    container_name: batvision-backend
+    restart: *restart
+    logging: *logging
     command: >
-      sh -c "
-      python manage.py migrate &&
-      python manage.py runserver 0.0.0.0:8000
-      "
-    environment:
-      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
-      - DJANGO_DEBUG=${DJANGO_DEBUG}
-      - DATABASE_URL=${DATABASE_URL}
-      - REDIS_URL=${REDIS_URL}
-      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
-      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
-      - MEDIA_ROOT=${MEDIA_ROOT}
-
-      # ✅ backend should look for outputs here
-      - OUTPUT_ROOT=/storage/bat_outputs
-
-      - AI_BASE_URL=${AI_BASE_URL}
-      - AI_INFER_PATH=/infer
-    volumes:
-      - ./backend:/app
-      - ${BAT_DATA_HOST_DIR}:/BAT_DataFolder
-
-      # ✅ same persisted output mount
-      - ${BAT_DATA_HOST_DIR}/output:/storage/bat_outputs
+      sh -c "python manage.py migrate --noinput &&
+             gunicorn bfitserver.wsgi:application
+               --bind 0.0.0.0:8000
+               --workers ${GUNICORN_WORKERS:-3}
+               --timeout 120
+               --access-logfile - --error-logfile -"
+    environment: *django-env
+    volumes: *django-volumes
     ports:
-      - "8000:8000"
+      - "${BACKEND_HOST_PORT:-8000}:8000"
     depends_on:
-      - db
-      - redis
-      - ai
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai:
+        condition: service_started
 
   worker:
     build:
       context: ./backend
-    container_name: bat-worker
-    restart: unless-stopped
-    command: celery -A bfitserver worker --loglevel=info
-    environment:
-      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
-      - DJANGO_DEBUG=${DJANGO_DEBUG}
-      - DATABASE_URL=${DATABASE_URL}
-      - REDIS_URL=${REDIS_URL}
-      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
-      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
-      - MEDIA_ROOT=${MEDIA_ROOT}
-
-      # ✅ worker should read/write outputs here too
-      - OUTPUT_ROOT=/storage/bat_outputs
-
-      - AI_BASE_URL=${AI_BASE_URL}
-      - AI_INFER_PATH=/infer
-    volumes:
-      - ./backend:/app
-      - ${BAT_DATA_HOST_DIR}:/BAT_DataFolder
-
-      # ✅ same persisted output mount
-      - ${BAT_DATA_HOST_DIR}/output:/storage/bat_outputs
+      target: runtime
+      args: *build-args
+    image: batvision/backend:${BATVISION_TAG:-latest}
+    container_name: batvision-worker
+    restart: *restart
+    logging: *logging
+    # one worker process: a case occupies the GPU for minutes, and the AI
+    # service serialises requests anyway
+    command: celery -A bfitserver worker --loglevel=info --concurrency=1
+    environment: *django-env
+    volumes: *django-volumes
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A bfitserver inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
     depends_on:
-      - backend
-      - redis
-      - ai
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      ai:
+        condition: service_started
 
   frontend:
     build:
       context: ./WebGUI/frontend
-    container_name: bat-frontend
-    restart: unless-stopped
-    command: npm run dev -- --host 0.0.0.0 --port 5173
-    environment:
-      - VITE_API_BASE_URL=http://localhost:8000
-    volumes:
-      - ./WebGUI/frontend:/app
-      - /app/node_modules
+      target: prod
+      args:
+        # empty => same origin, served through this container's /api proxy
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+    image: batvision/frontend:${BATVISION_TAG:-latest}
+    container_name: batvision-frontend
+    restart: *restart
+    logging: *logging
     ports:
-      - "5173:5173"
+      - "${FRONTEND_HOST_PORT:-5173}:5173"
     depends_on:
-      - backend
+      backend:
+        condition: service_started
 
+# Explicit names so the volumes do not move if the compose project is renamed.
+# Migrating from the old layout (project "src", volume "pgdata"):
+#   docker run --rm -v src_pgdata:/from -v batvision-pgdata:/to alpine \
+#     sh -c "cd /from && cp -a . /to"
 volumes:
-  pgdata:
-  ai_tmp:
+  batvision-pgdata:
+    name: batvision-pgdata
+  batvision-redis:
+    name: batvision-redis
+  batvision-ai-tmp:
+    name: batvision-ai-tmp

@@ -17,8 +17,18 @@ def _safe_json(resp: requests.Response):
     except Exception:
         return None
 
-AI_URL = os.environ.get("AI_URL", "http://ai:9000")
+# AI_BASE_URL is what docker-compose sets; AI_URL is kept as a legacy alias so
+# an existing .env keeps working.
+AI_URL = os.environ.get("AI_BASE_URL") or os.environ.get("AI_URL") or "http://ai:9000"
 AI_INFER_PATH = os.environ.get("AI_INFER_PATH", "/infer")
+
+# Which registered model the AI service should run ("agbnet", "baseline", ...).
+# Empty means "whatever the AI service is configured to default to".
+AI_MODEL = os.environ.get("AI_MODEL", "").strip()
+
+# A 3D nnU-Net prediction takes minutes; the ceiling is a stuck container, not a
+# slow case.
+AI_TIMEOUT_S = int(os.environ.get("AI_TIMEOUT_S", str(60 * 60)))
 
 @shared_task(bind=True)
 def run_case_ai(self, case_pk: int):
@@ -59,9 +69,11 @@ def run_case_ai(self, case_pk: int):
             "out_dir": out_dir,
             "case_id": case_id,
         }
+        if AI_MODEL:
+            payload["model"] = AI_MODEL
 
         # ---- call AI
-        r = requests.post(url, json=payload, timeout=60 * 60)
+        r = requests.post(url, json=payload, timeout=AI_TIMEOUT_S)
 
         # ✅ show real error body (instead of generic HTTPError)
         if not r.ok:
@@ -71,6 +83,9 @@ def run_case_ai(self, case_pk: int):
 
         msg = resp.get("message") or resp.get("status_message") or "Completed"
         out_dir_resp = resp.get("out_dir") or out_dir
+        model_name = (resp.get("model") or {}).get("name")
+        if model_name and model_name not in msg:
+            msg = f"{msg} — {model_name}"
 
         # ---- mark completed
         job.status = "completed"

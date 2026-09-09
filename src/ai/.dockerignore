@@ -1,0 +1,21 @@
+**/__pycache__/
+**/*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# weights and data are mounted, never copied into the image
+nnunet_raw/
+nnunet_results/
+nnunet_preprocessed/
+**/*.pth
+**/*.pt
+**/*.ckpt
+**/*.onnx
+**/*.nii
+**/*.nii.gz
+
+tmp/
+.env
+.env.*

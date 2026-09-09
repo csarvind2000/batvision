@@ -18,6 +18,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "change_me_to_a_long_random_string")
 DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
 
+# Request body cap. Django's 2.5 MB default is far too small here: a saved
+# annotation is a whole segmentation volume, and an uncompressed 160x160x104
+# uint8 mask is already 2.7 MB before base64. Exceeding it makes Django raise
+# RequestDataTooBig and return 400 *before the view runs*, which is impossible
+# to diagnose from the view's own logging.
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.environ.get("DJANGO_DATA_UPLOAD_MAX_MEMORY_SIZE", 512 * 1024 * 1024)
+)
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.environ.get("DJANGO_FILE_UPLOAD_MAX_MEMORY_SIZE", 64 * 1024 * 1024)
+)
+
 ALLOWED_HOSTS = os.environ.get(
     "DJANGO_ALLOWED_HOSTS",
     "localhost,127.0.0.1,backend,0.0.0.0,*",
@@ -68,8 +80,13 @@ WSGI_APPLICATION = "bfitserver.wsgi.application"
 # CORS (Frontend on 5173)
 # ------------------------------------------------------------------
 CORS_ALLOW_ALL_ORIGINS = False
+# Only needed when the UI is served from a different origin than the API, i.e.
+# the dev stack. The production image proxies /api through its own nginx, so
+# requests are same-origin and never reach this list.
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
+    o.strip()
+    for o in os.environ.get("DJANGO_CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    if o.strip()
 ]
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = list(default_headers) + [

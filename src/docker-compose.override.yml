@@ -1,0 +1,59 @@
+###############################################################################
+# Development overrides — applied automatically by `docker compose up`.
+#
+# Source trees are bind-mounted over the image, so edits are live: Django
+# reloads on save, Vite hot-reloads, and the AI service picks up Python changes
+# on restart (`docker compose restart ai`).
+#
+# For a production-shaped run, skip this file:
+#     docker compose -f docker-compose.yml up -d --build
+###############################################################################
+services:
+  backend:
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_DEBUG: "1"
+    volumes:
+      - ./backend:/app
+      - ${BAT_DATA_HOST_DIR}:/BAT_DataFolder
+      - ${BAT_DATA_HOST_DIR}/output:/storage/bat_outputs
+
+  worker:
+    environment:
+      DJANGO_DEBUG: "1"
+    volumes:
+      - ./backend:/app
+      - ${BAT_DATA_HOST_DIR}:/BAT_DataFolder
+      - ${BAT_DATA_HOST_DIR}/output:/storage/bat_outputs
+
+  ai:
+    # Flask's own server, so a traceback lands in `docker compose logs ai`
+    # instead of being swallowed by gunicorn's worker restart.
+    command: python app.py
+    environment:
+      BATAI_DEBUG: "1"
+      BATAI_KEEP_WORKDIR: "1"
+    volumes:
+      - ./ai/app.py:/app/app.py:ro
+      - ./ai/batai:/app/batai:ro
+      - ${BAT_MODELS_HOST_DIR}:/models/nnunet_results:ro
+      - ${BAT_DATA_HOST_DIR}:/BAT_DataFolder
+      - ${BAT_DATA_HOST_DIR}/output:/storage/bat_outputs
+      - batvision-ai-tmp:/tmp/batai
+
+  frontend:
+    build:
+      target: dev
+    # a separate tag: the dev target is the Vite server, not the nginx bundle
+    image: batvision/frontend:${BATVISION_TAG:-latest}-dev
+    command: npm run dev -- --host 0.0.0.0 --port 5173
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    volumes:
+      - ./WebGUI/frontend:/app
+      - /app/node_modules          # keep the image's node_modules, not the host's
+    # No `ports` here on purpose: Vite (dev) and nginx (prod) both listen on
+    # 5173 inside the container, so the base mapping is correct for both and
+    # there is nothing to override.

@@ -1,7 +1,10 @@
 // WebGUI/frontend/src/api/http.ts
 import axios from "axios";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+// `??`, not `||`: an explicitly empty VITE_API_BASE_URL means "same origin",
+// which is how the production image is served (nginx proxies /api itself).
+// An unset variable still falls back to the dev backend. Matches client.ts.
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
 function getToken(): string {
   return (

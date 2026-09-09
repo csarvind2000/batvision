@@ -28,9 +28,8 @@ Thumbs.db
 
 # misc
 *.tgz
-EOF
 
-# nnUNet outputs / weights
+# nnUNet weights — mounted at /models/nnunet_results, never committed
 src/ai/nnunet_results/
 **/nnunet_results/
 **/nnUNet_results/
@@ -38,3 +37,15 @@ src/ai/nnunet_results/
 **/*.pt
 **/*.ckpt
 **/*.onnx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# local dev database and uploaded case data — never commit patient imaging
+*.sqlite3
+src/backend/storage/

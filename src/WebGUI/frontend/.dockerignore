@@ -1,0 +1,16 @@
+node_modules/
+dist/
+build/
+.vite/
+coverage/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+.env
+.env.*
+!.env.example
+
+.git/
+.DS_Store

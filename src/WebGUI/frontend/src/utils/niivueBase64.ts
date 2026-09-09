@@ -33,7 +33,9 @@ export function base64NiftiToObjectUrl(
   mime: string = "application/gzip"
 ): { url: string; cleanup: () => void } {
   const bytes = base64ToUint8Array(b64);
-  const blob = new Blob([bytes], { type: mime });
+  // Uint8Array<ArrayBufferLike> is not a BlobPart under TS 5.9's lib.dom;
+  // .slice() gives a view that is definitely ArrayBuffer-backed.
+  const blob = new Blob([bytes.slice().buffer], { type: mime });
   const url = URL.createObjectURL(blob);
   console.log("[B64] created objectURL", { mime, bytes: bytes.length, urlPreview: url.slice(0, 48) + "..." });
   return { url, cleanup: () => URL.revokeObjectURL(url) };

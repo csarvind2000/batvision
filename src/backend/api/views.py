@@ -14,6 +14,15 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status as drf_status
 
+import gzip
+import shutil
+
+import requests
+
+from django.http import HttpResponse
+from datetime import datetime
+
+from . import cohort
 from .models import Case, CaseInput
 from .serializers import CaseSerializer
 from .tasks import run_case_ai
@@ -112,6 +121,14 @@ def _resolve_output_dir(subject_id: str) -> Optional[str]:
         if base and os.path.isdir(base):
             return base
     return None
+
+
+AI_BASE_URL = os.environ.get("AI_BASE_URL") or os.environ.get("AI_URL") or "http://ai:9000"
+AI_TIMEOUT_S = int(os.environ.get("AI_TIMEOUT_S", str(60 * 60)))
+
+
+def _join_ai_url(path: str) -> str:
+    return AI_BASE_URL.rstrip("/") + "/" + path.lstrip("/")
 
 
 def _compute_mask_volumes_ml(mask_path: str, mask_type: str) -> dict:
@@ -290,13 +307,22 @@ def cases_status(request, case_id: int):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def cases_bat_review(request, case_id: int):
-    """
-    GET /api/cases/<id>/bat-review/
+    """GET /api/cases/<id>/bat-review/"""
+    return _bat_review_response(case_id)
+
+
+def _bat_review_response(case_id: int):
+    """The review payload, built independently of the request.
+
+    Split out so save-annotation can return the freshly recomputed payload too.
+    Calling the view directly did not work: it is an @api_view(["GET"]), so a
+    POST reached it as a 405, and the DRF Request it was handed tripped an
+    assertion before that.
 
     Returns:
       {
         case: {...},
-        nifti: { image_b64, binary_b64, class4_b64, class3_b64, ... },
+        nifti: { image_b64, ff_b64, binary_b64, class4_b64, class3_b64, ... },
         volumes: {...},                     # now supports bat_metrics.json
         debug: { used_out_dir, found_files, metrics_json_path, ... }
       }
@@ -320,7 +346,12 @@ def cases_bat_review(request, case_id: int):
         if not base or not os.path.isdir(base):
             continue
 
+        # Edited masks come first: once a reviewer has corrected a mask, that is
+        # the mask the app must show -- and it is what the review still shows if
+        # re-stratification could not run. The model's own output is snapshotted
+        # to <out_dir>/original/ the first time a case is edited.
         binary_cands = [
+            "pred_binary_edited.nii.gz",
             "pred_binary.nii.gz",
             "bat_binary.nii.gz",
             "BAT_binary.nii.gz",
@@ -329,6 +360,7 @@ def cases_bat_review(request, case_id: int):
             "segmentation_binary.nii.gz",
         ]
         class4_cands = [
+            "mask_4class_edited.nii.gz",
             "mask_4class.nii.gz",
             "bat_4class.nii.gz",
             "BAT_4class.nii.gz",
@@ -338,6 +370,7 @@ def cases_bat_review(request, case_id: int):
             "multi_class_4.nii.gz",
         ]
         class3_cands = [
+            "mask_3class_edited.nii.gz",
             "mask_3class.nii.gz",
             "bat_3class.nii.gz",
             "BAT_3class.nii.gz",
@@ -373,6 +406,25 @@ def cases_bat_review(request, case_id: int):
         )
         if fat_fallback:
             fat_path = fat_fallback
+
+    # Fat-fraction image: same lookup as fat, so the viewer's FAT / FAT FRACTION
+    # toggle has a second volume to switch to. Optional on purpose -- a case
+    # uploaded without it still reviews fine, the toggle just stays disabled.
+    ff_input = CaseInput.objects.filter(case=case, channel="fat_fraction").first()
+    ff_path = ff_input.file_path if ff_input else None
+
+    if (not ff_path or not os.path.exists(ff_path)) and found_out_dir:
+        ff_fallback = _first_existing(
+            [
+                os.path.join(found_out_dir, f"{subject_id}_FF_0001.nii.gz"),
+                os.path.join(found_out_dir, f"{subject_id}_FF_0001.nii"),
+            ]
+        )
+        if ff_fallback:
+            ff_path = ff_fallback
+
+    if ff_path and not os.path.exists(ff_path):
+        ff_path = None
 
     missing = []
     if not fat_path or not os.path.exists(fat_path):
@@ -436,12 +488,18 @@ def cases_bat_review(request, case_id: int):
             "binary_name": os.path.basename(binary_path),
             "class4_name": os.path.basename(class4_path),
             "class3_name": os.path.basename(class3_path),
+            # absent when the case has no fat-fraction volume; the viewer keys
+            # its FAT FRACTION toggle off exactly this
+            "ff_b64": _file_to_b64(ff_path) if ff_path else None,
+            "ff_name": os.path.basename(ff_path) if ff_path else None,
         },
         "volumes": volumes,
         "debug": {
             "used_output_directory": found_out_dir,
             "found_files_in_dir": found_files,
             "metrics_json_path": metrics_path,
+            "fat_path": fat_path,
+            "ff_path": ff_path,
             "metrics_json_loaded": bool(metrics),
             "metrics_keys": list(metrics.keys()) if isinstance(metrics, dict) else None,
         },
@@ -491,6 +549,17 @@ def cases_bat_review_save_annotation(request, case_id: int):
         except Exception as e:
             return Response({"detail": f"Cannot create output dir: {found_out_dir} ({e})"}, status=500)
 
+    # A .nii.gz path must actually be gzip. Niivue decides compression from the
+    # filename it is given, and the viewer asks for the bytes back by passing an
+    # empty one -- so a client can post uncompressed data under a .gz name,
+    # which nibabel then refuses to read. Compress here when it is not already
+    # compressed, rather than writing a file that lies about its format.
+    if filename.lower().endswith(".gz") and edited_bytes[:2] != b"\x1f\x8b":
+        try:
+            edited_bytes = gzip.compress(edited_bytes)
+        except Exception as e:
+            return Response({"detail": f"Could not gzip the mask: {e}"}, status=400)
+
     save_path = os.path.join(found_out_dir, filename)
     try:
         with open(save_path, "wb") as f:
@@ -515,13 +584,108 @@ def cases_bat_review_save_annotation(request, case_id: int):
     except Exception:
         pass
 
-    # Recompute volumes (best effort)
-    try:
-        new_vols = _compute_mask_volumes_ml(save_path, mask_type)
-        metrics["volumes"].update(new_vols)
-    except Exception as e:
-        metrics.setdefault("warnings", [])
-        metrics["warnings"].append(f"volume_recompute_failed: {str(e)}")
+    # Editing the BAT mask invalidates far more than one number. The 3- and
+    # 4-class maps are percentile bands of the fat-fraction distribution *inside*
+    # the mask, so a corrected mask needs the whole stratification run again --
+    # counting labels in the now-stale class maps would leave class3_total_ml
+    # disagreeing with binary_total_ml. The AI service owns that code, so we ask
+    # it rather than reimplementing it here and letting the two drift.
+    restratified = False
+    if mask_type == "binary":
+        # Re-stratification rewrites pred_binary / mask_3class / mask_4class /
+        # ff_percentile in place, so the model's own output would be gone after
+        # the first edit. Snapshot it once, the first time a case is edited, and
+        # never again -- so `original/` always holds what the model produced and
+        # an edit stays auditable and reversible.
+        original_dir = os.path.join(found_out_dir, "original")
+        if not os.path.isdir(original_dir):
+            try:
+                os.makedirs(original_dir, exist_ok=True)
+                for name in (
+                    "pred_binary.nii.gz",
+                    "pred_label.nii.gz",
+                    "mask_3class.nii.gz",
+                    "mask_4class.nii.gz",
+                    "ff_percentile.nii.gz",
+                    "bat_metrics.json",
+                ):
+                    src = os.path.join(found_out_dir, name)
+                    if os.path.isfile(src):
+                        shutil.copy2(src, os.path.join(original_dir, name))
+            except Exception as e:
+                metrics.setdefault("warnings", [])
+                metrics["warnings"].append(f"original_snapshot_failed: {e}")
+
+        fat_in = CaseInput.objects.filter(case=case, channel="fat").first()
+        ff_in = CaseInput.objects.filter(case=case, channel="fat_fraction").first()
+        fat_p = fat_in.file_path if fat_in else None
+        ff_p = ff_in.file_path if ff_in else None
+
+        if fat_p and ff_p and os.path.exists(fat_p) and os.path.exists(ff_p):
+            try:
+                r = requests.post(
+                    _join_ai_url("/restratify"),
+                    json={
+                        "case_id": subject_id,
+                        "fat_path": fat_p,
+                        "ff_path": ff_p,
+                        "mask_path": save_path,
+                        "out_dir": found_out_dir,
+                    },
+                    timeout=AI_TIMEOUT_S,
+                )
+                if r.ok:
+                    restratified = True
+                    # Re-stratification regenerates mask_3class / mask_4class
+                    # from the corrected BAT mask, which supersedes any earlier
+                    # hand-edited class map: those were derived from a mask that
+                    # no longer exists. Left in place they keep winning the
+                    # *_edited preference in the candidate lists above, so the
+                    # class overlays and their volumes silently disagree with
+                    # the binary mask. Archive rather than delete -- it is still
+                    # someone's manual work.
+                    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    superseded_dir = os.path.join(found_out_dir, "superseded")
+                    for stale in ("mask_3class_edited.nii.gz", "mask_4class_edited.nii.gz"):
+                        stale_path = os.path.join(found_out_dir, stale)
+                        if not os.path.isfile(stale_path):
+                            continue
+                        try:
+                            os.makedirs(superseded_dir, exist_ok=True)
+                            shutil.move(
+                                stale_path, os.path.join(superseded_dir, f"{stamp}_{stale}")
+                            )
+                        except Exception as e:
+                            metrics.setdefault("warnings", [])
+                            metrics["warnings"].append(f"could_not_archive_{stale}: {e}")
+                    # postprocess rewrote bat_metrics.json itself; re-read rather
+                    # than merging, so we cannot half-overwrite its output.
+                    metrics = _read_json(metrics_path) or metrics
+                    metrics.setdefault("annotations", [])
+                    metrics["annotations"].append(
+                        {"filename": filename, "mask_type": mask_type, "restratified": True}
+                    )
+                else:
+                    metrics.setdefault("warnings", [])
+                    metrics["warnings"].append(f"restratify_failed: {r.status_code} {r.text[:300]}")
+            except Exception as e:
+                metrics.setdefault("warnings", [])
+                metrics["warnings"].append(f"restratify_unavailable: {e}")
+        else:
+            metrics.setdefault("warnings", [])
+            metrics["warnings"].append(
+                "restratify_skipped: fat/fat_fraction inputs not on disk for this case"
+            )
+
+    if not restratified:
+        # A class map was edited directly, or re-stratification was unavailable:
+        # fall back to counting labels in the file just saved.
+        try:
+            new_vols = _compute_mask_volumes_ml(save_path, mask_type)
+            metrics["volumes"].update(new_vols)
+        except Exception as e:
+            metrics.setdefault("warnings", [])
+            metrics["warnings"].append(f"volume_recompute_failed: {str(e)}")
 
     try:
         with open(metrics_path, "w") as f:
@@ -530,8 +694,9 @@ def cases_bat_review_save_annotation(request, case_id: int):
         # do not fail the request if json write fails
         pass
 
-    # Return same payload as GET /bat-review/ so frontend can refresh UI easily
-    return cases_bat_review(request, case_id)
+    # The same payload GET /bat-review/ returns, so the frontend refreshes in one
+    # round trip.
+    return _bat_review_response(case_id)
 
 
 @csrf_exempt
@@ -557,3 +722,102 @@ def cases_delete(request):
         )
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
+
+# ---------------------------------------------------------------------------
+# cohort
+# ---------------------------------------------------------------------------
+def _cohort_rows(ids: Optional[List[int]] = None) -> List[dict]:
+    """Every case (or just `ids`) flattened to one row of volumes."""
+    queryset = Case.objects.all().order_by("case_id")
+    if ids:
+        queryset = queryset.filter(pk__in=ids)
+
+    rows = []
+    for case in queryset:
+        subject_id = getattr(case, "case_id", None) or str(case.pk)
+        out_dir = _resolve_output_dir(subject_id)
+        rows.append(cohort.case_to_row(case, out_dir, cohort.read_metrics(out_dir)))
+    return rows
+
+
+def _requested_ids(request) -> Optional[List[int]]:
+    """`?ids=1,2,3` restricts the export to a hand-picked selection."""
+    raw = (request.GET.get("ids") or "").strip()
+    if not raw:
+        return None
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.append(int(part))
+    return out or None
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def cohort_list(request):
+    """GET /api/cohort/ — the cohort table plus its aggregates."""
+    rows = _cohort_rows()
+    return Response(
+        {
+            "columns": [
+                {"key": key, "label": label, "group": group}
+                for group, columns in (
+                    ("identity", cohort.BASE_COLUMNS),
+                    ("volumes", cohort.VOLUME_COLUMNS),
+                    ("qc", cohort.QC_COLUMNS),
+                )
+                for key, label in columns
+            ],
+            "rows": rows,
+            "summary": cohort.summarise(rows),
+        },
+        status=200,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def cohort_export(request):
+    """GET /api/cohort/export/?fmt=xlsx|csv[&ids=1,2,3] — the sheet as a file.
+
+    The parameter is `fmt`, not `format`: DRF reserves `format` for renderer
+    selection (URL_FORMAT_OVERRIDE), so `?format=xlsx` makes content negotiation
+    look for an "xlsx" renderer and raise Http404 before the view ever runs.
+    """
+    fmt = (request.GET.get("fmt") or "xlsx").lower()
+    rows = _cohort_rows(_requested_ids(request))
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+
+    if fmt == "csv":
+        response = HttpResponse(cohort.rows_to_csv(rows), content_type="text/csv")
+        response["Content-Disposition"] = f'attachment; filename="bat-cohort-{stamp}.csv"'
+        return response
+
+    if fmt != "xlsx":
+        return Response({"error": f"Unsupported fmt {fmt!r}; use xlsx or csv"}, status=400)
+
+    try:
+        content = cohort.build_workbook(rows, cohort.summarise(rows))
+    except ImportError:
+        return Response(
+            {"error": "openpyxl is not installed in the backend image; use format=csv"},
+            status=501,
+        )
+
+    response = HttpResponse(
+        content,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    response["Content-Disposition"] = f'attachment; filename="bat-cohort-{stamp}.xlsx"'
+    return response
+
+
+
+# ---------------------------------------------------------------------------
+# health
+# ---------------------------------------------------------------------------
+@csrf_exempt
+def health(request):
+    """Unauthenticated liveness probe, used by the container HEALTHCHECK."""
+    return JsonResponse({"ok": True, "service": "batvision-backend"})

@@ -304,3 +304,67 @@ export async function apiSaveBatAnnotation(caseId: number, body: SaveBatAnnotati
 
   return res.json();
 }
+// ---------------------------------------------------------------------------
+// Cohort
+// ---------------------------------------------------------------------------
+export type CohortRow = {
+  id: number;
+  case_id: string;
+  patient_id: string;
+  patient_name: string;
+  status: string;
+  created_at: string;
+  has_metrics: boolean;
+  [key: string]: string | number | boolean | null;
+};
+
+export type CohortStat = {
+  n: number;
+  mean: number | null;
+  sd: number | null;
+  min: number | null;
+  max: number | null;
+};
+
+export type CohortPayload = {
+  columns: { key: string; label: string; group: "identity" | "volumes" | "qc" }[];
+  rows: CohortRow[];
+  summary: {
+    cases: number;
+    measured: number;
+    unmeasured: number;
+    statuses: Record<string, number>;
+    metrics: Record<string, CohortStat>;
+  };
+};
+
+export async function apiCohort(): Promise<CohortPayload> {
+  const res = await apiFetch("/cohort/", { method: "GET" });
+  await ensureOk(res);
+  return res.json();
+}
+
+/**
+ * The cohort sheet as a file.
+ *
+ * Fetched rather than linked: the export endpoint needs the Authorization
+ * header, which a plain <a href> cannot carry.
+ */
+export async function apiCohortExport(
+  format: "xlsx" | "csv",
+  ids?: (string | number)[]
+): Promise<{ blob: Blob; filename: string }> {
+  // `fmt`, not `format`: DRF treats `format` as its renderer override and 404s.
+  const query = new URLSearchParams({ fmt: format });
+  if (ids && ids.length) query.set("ids", ids.join(","));
+
+  const res = await apiFetch(`/cohort/export/?${query.toString()}`, { method: "GET" });
+  await ensureOk(res);
+
+  const disposition = res.headers.get("Content-Disposition") || "";
+  const match = /filename="?([^"]+)"?/.exec(disposition);
+  return {
+    blob: await res.blob(),
+    filename: match?.[1] || `bat-cohort.${format}`,
+  };
+}

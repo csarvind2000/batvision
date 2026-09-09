@@ -1,12 +1,21 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-pydantic==2.9.2
-redis==5.0.8
-rq==1.16.2
-requests==2.32.3
-flask
-numpy
-SimpleITK
-nnunetv2
-torch
-numpy
+# BATVision inference service — pinned to the environment AGB-Net was trained in
+# (nnunetv2 2.6.2 / dynamic_network_architectures 0.4.2 / torch 2.7.1+cu126).
+# torch itself comes from the CUDA base image; do NOT add it here or pip will
+# pull the CPU wheel over it.
+
+# --- nnU-Net stack -----------------------------------------------------------
+nnunetv2==2.6.2
+dynamic_network_architectures==0.4.2
+batchgenerators==0.25.1
+batchgeneratorsv2==0.3.0
+acvl_utils==0.2.5
+
+# --- imaging / numerics ------------------------------------------------------
+numpy==2.2.6
+scipy==1.15.3
+SimpleITK==2.4.0
+nibabel==5.3.2
+
+# --- service -----------------------------------------------------------------
+Flask==3.0.3
+gunicorn==23.0.0

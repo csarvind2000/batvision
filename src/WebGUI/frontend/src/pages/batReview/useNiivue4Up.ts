@@ -1,6 +1,6 @@
 // src/pages/BatReview/useNiivue4Up.ts
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Niivue, NVImage } from "@niivue/niivue";
+import { Niivue, NVImage, NVUtilities } from "@niivue/niivue";
 import { base64NiftiToObjectUrl } from "../../utils/niivueBase64";
 
 export type MaskType = "binary" | "c3" | "c4";
@@ -24,6 +24,27 @@ type Nv4 = {
   render3D: Niivue;
 };
 
+export type ViewKey = "axial" | "coronal" | "sagittal" | "render3D";
+
+/**
+ * Pane order used everywhere: pane 0 is the "main" one in the 1+3 layout, and
+ * the 3D render is always last so a 3-across layout can simply drop it.
+ *
+ * `axis` is the index into a voxel/crosshair triple that this view slices
+ * along, which is what turns a crosshair position into a slice number.
+ */
+export const VIEWS: ReadonlyArray<{
+  key: ViewKey;
+  label: string;
+  short: string;
+  axis: 0 | 1 | 2 | null;   // null => 3D render, it has no slice index
+}> = [
+  { key: "axial", label: "Axial", short: "AX", axis: 2 },
+  { key: "coronal", label: "Coronal", short: "COR", axis: 1 },
+  { key: "sagittal", label: "Sagittal", short: "SAG", axis: 0 },
+  { key: "render3D", label: "3D", short: "3D", axis: null },
+];
+
 function hasWebGL(): boolean {
   try {
     const c = document.createElement("canvas");
@@ -43,17 +64,21 @@ export function makeBatLut(mask: MaskType): Uint8Array {
     lut[i] = r; lut[i + 1] = g; lut[i + 2] = b; lut[i + 3] = a;
   };
 
+  // Kept in sync with CLASS_COLORS in theme.ts, which labels the same classes in
+  // the side panel. Saturated RGB primaries (255,0,0 / 0,255,0 / 0,0,255) read
+  // as fringing over a greyscale MRI and make thin BAT boundaries harder to
+  // judge; these are the same hues pulled off full saturation.
   if (mask === "binary") {
-    set(1, 255, 0, 0, 255);
+    set(1, 255, 59, 48, 255);
   } else if (mask === "c3") {
-    set(1, 255, 0, 0, 255);
-    set(2, 0, 255, 0, 255);
-    set(3, 0, 0, 255, 255);
+    set(1, 255, 59, 48, 255);
+    set(2, 52, 199, 89, 255);
+    set(3, 10, 132, 255, 255);
   } else {
-    set(1, 255, 0, 0, 255);
-    set(2, 0, 255, 0, 255);
-    set(3, 0, 0, 255, 255);
-    set(4, 255, 255, 0, 255);
+    set(1, 255, 59, 48, 255);
+    set(2, 52, 199, 89, 255);
+    set(3, 10, 132, 255, 255);
+    set(4, 255, 214, 10, 255);
   }
   return lut;
 }
@@ -98,28 +123,31 @@ function sniffBytes(label: string, bytes: Uint8Array) {
 }
 
 /**
- * ✅ No glasbey dependency.
- * Apply LUT safely across Niivue builds.
+ * Point the drawing colormap at `lut` (RGBA x 256) and get it onto the GPU.
+ *
+ * The upload is the part that is easy to miss: Niivue only copies
+ * `drawLut.lut` into the colormap texture inside refreshColormaps(). Setting
+ * the LUT and then calling refreshDrawing()/drawScene() -- which is what this
+ * did before -- re-uploads the drawing *bitmap* but not the *colours*, so the
+ * new LUT never took effect and the canvas kept rendering with whichever LUT
+ * happened to be uploaded last. That is why a 4-class mask could come up drawn
+ * entirely in the binary mask's red: same bitmap, stale palette.
  */
 function applyDrawLutSafe(nv: any, lut?: Uint8Array) {
   if (!lut) return;
   try {
     if (!nv.drawLut || typeof nv.drawLut !== "object") {
-      nv.drawLut = { lut: lut, labels: new Array(256).fill("") };
-    }
-    if (nv.drawLut && typeof nv.drawLut === "object") {
-      nv.drawLut.lut = lut;
-      if (!nv.drawLut.labels) nv.drawLut.labels = new Array(256).fill("");
-      if (Array.isArray(nv.drawLut.labels) && nv.drawLut.labels.length < 256) {
-        nv.drawLut.labels = [
-          ...nv.drawLut.labels,
-          ...new Array(256 - nv.drawLut.labels.length).fill(""),
-        ];
-      }
+      nv.drawLut = { lut, labels: new Array(256).fill("") };
     } else {
-      nv.drawLut = lut;
+      nv.drawLut.lut = lut;
+      if (!Array.isArray(nv.drawLut.labels) || nv.drawLut.labels.length < 256) {
+        nv.drawLut.labels = new Array(256).fill("");
+      }
     }
-    nv.refreshDrawing?.();
+
+    // the line that actually makes the palette visible
+    nv.refreshColormaps?.();
+    nv.refreshDrawing?.(false);
     nv.drawScene?.();
   } catch (e) {
     console.warn("[NV] applyDrawLutSafe failed", e);
@@ -171,49 +199,34 @@ function getLocationMMBestEffort(v: any): number[] | null {
  * - Fallback: objectURL and use loadDrawingFromUrl({url})
  */
 async function loadDrawingRobust(v: any, bytes: Uint8Array, name = "mask.nii.gz") {
-  // Some builds accept bytes directly
-  try {
-    if (typeof v.loadDrawingFromUrl === "function") {
-      await v.loadDrawingFromUrl(bytes);
-      return;
-    }
-  } catch {}
+  // loadDrawingFromUrl catches its own errors and reports failure by RETURNING
+  // FALSE rather than throwing. Treating the call as successful just because it
+  // did not throw is how a mask silently fails to load and the previous overlay
+  // stays on screen -- so the boolean has to be checked, not discarded.
+  if (typeof v.loadDrawingFromUrl !== "function") {
+    throw new Error("No supported drawing loader on this Niivue build.");
+  }
 
-  const blob = new Blob([bytes], { type: "application/gzip" });
+  try {
+    if ((await v.loadDrawingFromUrl(bytes)) === true) return;
+  } catch {
+    // fall through to the object-URL form below
+  }
+
+  const blob = new Blob([bytes.slice().buffer], { type: "application/gzip" });
   const url = URL.createObjectURL(blob);
   try {
-    if (typeof v.loadDrawingFromUrl === "function") {
-      await v.loadDrawingFromUrl({ url, name });
+    if ((await v.loadDrawingFromUrl({ url, name })) === true) return;
+    if (typeof v.loadDrawing === "function" && (await v.loadDrawing({ url, name })) === true) {
       return;
     }
-    if (typeof v.loadDrawing === "function") {
-      await v.loadDrawing({ url, name });
-      return;
-    }
-    throw new Error("No supported drawing loader on this Niivue build.");
+    throw new Error(
+      `Niivue could not load the mask "${name}". It usually means the mask grid ` +
+        "does not match the base image."
+    );
   } finally {
     URL.revokeObjectURL(url);
   }
-}
-
-/**
- * Throttle sync work to animation frames (smooth scroll).
- */
-function makeRafThrottler() {
-  let scheduled = false;
-  let lastArgs: any[] | null = null;
-
-  return (fn: (...args: any[]) => void, ...args: any[]) => {
-    lastArgs = args;
-    if (scheduled) return;
-    scheduled = true;
-    requestAnimationFrame(() => {
-      scheduled = false;
-      const a = lastArgs;
-      lastArgs = null;
-      if (a) fn(...a);
-    });
-  };
 }
 
 export function useNiivue4Up() {
@@ -241,12 +254,6 @@ export function useNiivue4Up() {
 
   // mask cache
   const maskBytesCacheRef = useRef<Map<string, Uint8Array>>(new Map());
-
-  // prevent recursion loops
-  const syncingRef = useRef(false);
-
-  // throttlers for sync
-  const rafSync = useRef(makeRafThrottler());
 
   const forceResizeAndDraw = useCallback(() => {
     const nv = nvRef.current;
@@ -294,7 +301,12 @@ export function useNiivue4Up() {
           isColorbar: false,
           isOrientCube: false,
           isRuler: false,
-          isCrosshair: true,
+          // 0.67 has no `isCrosshair`; the 2D crosshair is drawn whenever it has
+          // a width, and passing an unknown key here is silently ignored.
+          crosshairWidth: 1,
+          // leave the centre clear: a solid cross hides the voxel it points at,
+          // which is exactly the one a reviewer is looking at
+          crosshairGap: 12,
           show3Dcrosshair: false,
           backColor: [0.06, 0.07, 0.09, 1],
         });
@@ -336,85 +348,69 @@ export function useNiivue4Up() {
     return () => window.removeEventListener("resize", onResize);
   }, [attachReady, forceResizeAndDraw]);
 
-  // ---------------- FULL SYNC: crosshair + scroll ----------------
+  // ---------------- crosshair / camera sync ----------------
+  // Niivue drives this itself: broadcastTo mirrors 2D crosshair + pan and the
+  // 3D camera from one instance to the others, and it fires on every source of
+  // change (click, drag, wheel, keyboard) rather than only the ones a callback
+  // happens to cover. An earlier version of this hook monkey-patched
+  // setSliceMM/setCrosshairPos and re-broadcast through a RAF throttle; that
+  // missed wheel-scroll on builds that do not route it through those setters,
+  // which is why the views drifted apart.
   useEffect(() => {
     if (!attachReady) return;
     const nv = nvRef.current;
     if (!nv) return;
 
-    const viewers: any[] = [nv.axial, nv.sagittal, nv.coronal, nv.render3D];
-
-    const broadcastMM = (srcIdx: number, mm: number[]) => {
-      if (syncingRef.current) return;
-      syncingRef.current = true;
-
+    const viewers = [nv.axial, nv.sagittal, nv.coronal, nv.render3D];
+    viewers.forEach((v) => {
+      const others = viewers.filter((o) => o !== v);
       try {
-        viewers.forEach((dst, dstIdx) => {
-          if (dstIdx === srcIdx) return;
-          setLocationBestEffort(dst, mm);
-          dst.drawScene?.();
-        });
-      } finally {
-        syncingRef.current = false;
+        v.broadcastTo(others, { "2d": true, "3d": true });
+      } catch (e) {
+        console.warn("[NV] broadcastTo unavailable on this build", e);
       }
-    };
+    });
 
-    const hook = (v: any, idx: number) => {
-      // 1) Crosshair move (mouse move/click)
-      try {
-        v.onLocationChange = (loc: any) => {
-          const mm: number[] | undefined = loc?.mm;
-          if (!mm || mm.length < 3) return;
-          rafSync.current(broadcastMM, idx, [mm[0], mm[1], mm[2]]);
-        };
-      } catch {}
-
-      // 2) Scroll / slice change (wheel)
-      // Different builds: onSliceChange can be number or object.
-      try {
-        v.onSliceChange = (_arg: any) => {
-          const mm = getLocationMMBestEffort(v);
-          if (!mm) return;
-          rafSync.current(broadcastMM, idx, mm);
-        };
-      } catch {}
-
-      // 3) Extra fallback: patch setSliceMM / setCrosshairPos so ANY internal change syncs
-      // This catches cases where Niivue doesn’t fire the callbacks on wheel.
-      const patchFn = (fnName: string) => {
-        const orig = v[fnName];
-        if (typeof orig !== "function") return () => {};
-        if (orig.__patchedSync) return () => {}; // already patched
-
-        const wrapped = (...args: any[]) => {
-          const ret = orig.apply(v, args);
+    // broadcastTo is not enough on its own for the mouse wheel. Niivue calls
+    // sync() from wheelListener only on the zoom branch; the ordinary
+    // slice-scroll path ends at sliceScroll2D(), which never syncs. So a wheel
+    // scroll moved one pane and left the other three behind. Pushing sync()
+    // ourselves after the canvas has handled the event fixes it without
+    // touching Niivue internals -- our listener is registered after Niivue's,
+    // so it runs once the new slice is already in place.
+    const cleanups = viewers.map((v) => {
+      // gl.canvas is typed as HTMLCanvasElement | OffscreenCanvas; only the
+      // former has addEventListener, and it is always the former here.
+      const canvas = v?.gl?.canvas;
+      if (!canvas || !(canvas instanceof HTMLCanvasElement)) return () => {};
+      let queued = false;
+      const onWheel = () => {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(() => {
+          queued = false;
           try {
-            const mm = getLocationMMBestEffort(v);
-            if (mm) rafSync.current(broadcastMM, idx, mm);
-          } catch {}
-          return ret;
-        };
-        wrapped.__patchedSync = true;
-        v[fnName] = wrapped;
-        return () => { v[fnName] = orig; };
+            v.sync();
+          } catch (e) {
+            console.warn("[NV] sync after wheel failed", e);
+          }
+        });
       };
+      canvas.addEventListener("wheel", onWheel, { passive: true });
+      return () => canvas.removeEventListener("wheel", onWheel);
+    });
 
-      const unpatch1 = patchFn("setSliceMM");
-      const unpatch2 = patchFn("setCrosshairPos");
-      const unpatch3 = patchFn("setCrosshairXYZ");
-      const unpatch4 = patchFn("setLocation");
-
-      return () => {
-        try { v.onLocationChange = null; } catch {}
-        try { v.onSliceChange = null; } catch {}
-        unpatch1(); unpatch2(); unpatch3(); unpatch4();
-      };
-    };
-
-    const cleanups = viewers.map((v, i) => hook(v, i));
-
-    return () => { cleanups.forEach((c) => { try { c(); } catch {} }); };
+    return () => cleanups.forEach((c) => c());
   }, [attachReady]);
+
+  /** Push one viewer's crosshair to the other three (see the wheel note above). */
+  const syncFrom = useCallback((v: any) => {
+    try {
+      v?.sync?.();
+    } catch (e) {
+      console.warn("[NV] sync failed", e);
+    }
+  }, []);
 
   // ---------------- base load ----------------
   const loadBaseFromB64 = useCallback(
@@ -433,10 +429,14 @@ export function useNiivue4Up() {
 
       const base = await NVImage.loadFromUrl({ url, name });
 
-      await nv.axial.loadVolumes([base]);
-      await nv.sagittal.loadVolumes([base]);
-      await nv.coronal.loadVolumes([base]);
-      await nv.render3D.loadVolumes([base]);
+      // loadVolumes is typed for ImageFromUrlOptions, but accepts an already
+      // constructed NVImage at runtime — which is what we want, so the four
+      // viewers share one decode of the volume instead of fetching it 4x.
+      const volumes = [base] as unknown as Parameters<Niivue["loadVolumes"]>[0];
+      await nv.axial.loadVolumes(volumes);
+      await nv.sagittal.loadVolumes(volumes);
+      await nv.coronal.loadVolumes(volumes);
+      await nv.render3D.loadVolumes(volumes);
 
       // After loading base, force all to same location (prevents desync on first scroll)
       const mm = getLocationMMBestEffort(nv.axial as any) || [0, 0, 0];
@@ -528,20 +528,39 @@ export function useNiivue4Up() {
   );
 
   // ---------------- edit tools ----------------
-  const applyEdit = useCallback((mode: EditMode, brushSize: number, label: number) => {
-    const nv = nvRef.current;
-    if (!nv) return;
+  const applyEdit = useCallback(
+    (mode: EditMode, brushSize: number, label: number, filled: boolean = true) => {
+      const nv = nvRef.current;
+      if (!nv) return;
 
-    const viewers: any[] = [nv.axial, nv.sagittal, nv.coronal, nv.render3D];
-    viewers.forEach((v) => {
+      const viewers: any[] = [nv.axial, nv.sagittal, nv.coronal, nv.render3D];
       const enabled = mode !== "off";
-      try { v.setDrawingEnabled?.(enabled); } catch { v.drawingEnabled = enabled; }
-      try { v.setPenSize?.(brushSize); } catch { v.penSize = brushSize; }
 
-      const penValue = mode === "erase" ? 0 : Math.max(1, Math.floor(label || 1));
-      try { v.setPenValue?.(penValue); } catch { v.penValue = penValue; }
-    });
-  }, []);
+      viewers.forEach((v) => {
+        try { v.setDrawingEnabled?.(enabled); } catch { v.drawingEnabled = enabled; }
+        try { v.setPenSize?.(brushSize); } catch { v.penSize = brushSize; }
+
+        // setPenValue's second argument is isFilledPen: closing a loop in one
+        // drag flood-fills its interior, so outlining a depot paints it solid
+        // instead of leaving a ring the user has to scribble in.
+        const penValue = mode === "erase" ? 0 : Math.max(1, Math.floor(label || 1));
+        try {
+          v.setPenValue?.(penValue, enabled && filled);
+        } catch {
+          v.penValue = penValue;
+          if (v.opts) v.opts.isFilledPen = enabled && filled;
+        }
+
+        // The crosshair sits exactly where the pen is, so it hides whatever is
+        // being drawn. Take it away while a tool is active and restore it after.
+        try {
+          if (v.opts) v.opts.crosshairWidth = enabled ? 0 : 1;
+          v.drawScene?.();
+        } catch {}
+      });
+    },
+    []
+  );
 
   const undo = useCallback(() => {
     const nv = nvRef.current;
@@ -562,36 +581,75 @@ export function useNiivue4Up() {
   }, []);
 
   /**
-   * Best-effort export; never crash SAVE button.
-   * (This stays as you wrote it. If your Niivue cannot export, backend-save is required.)
+   * Export the edited drawing as gzipped NIfTI, base64-encoded.
+   *
+   * Niivue 0.67 exports a drawing through saveImage({ isSaveDrawing: true }),
+   * which returns the bytes when the filename is empty and triggers a browser
+   * download when it is not. An earlier version called saveDrawing(), which
+   * does not exist on this build, so every save threw.
    */
   const exportEditedMaskB64 = useCallback(async (): Promise<string> => {
     const nv = nvRef.current;
     if (!nv) throw new Error("Viewer not ready");
 
-    const v: any = nv.axial as any;
+    const v = nv.axial as any;
+    if (typeof v.saveImage !== "function") {
+      throw new Error(
+        "This Niivue build exposes no drawing export (saveImage). Upgrade @niivue/niivue."
+      );
+    }
 
+    // An empty filename returns the bytes instead of triggering a browser
+    // download -- but Niivue decides compression from that same filename
+    // (`compress = fnm.endsWith(".gz")`), so what comes back is an
+    // *uncompressed* NIfTI. Left as-is that is ~2.7 MB for a 160x160x104
+    // volume, which overflows Django's 2.5 MB request cap, and it would be
+    // written to a .nii.gz path that is not actually gzipped.
+    const raw = await v.saveImage({
+      filename: "",
+      isSaveDrawing: true,
+      volumeByIndex: 0,
+    });
+
+    if (!(raw instanceof Uint8Array) || raw.length === 0) {
+      throw new Error(
+        "Niivue returned no drawing bytes — is a mask loaded and edited?"
+      );
+    }
+
+    // Gzip it ourselves, with Niivue's own helper, so the payload really is a
+    // .nii.gz. A BAT mask is almost entirely zeros, so this is a ~500x
+    // reduction, not a marginal one.
+    let result: Uint8Array;
     try {
-      if (typeof v.saveDrawing === "function") {
-        const bytes: Uint8Array = await v.saveDrawing();
-        // chunk-safe base64
-        const CHUNK = 0x8000;
-        let s = "";
-        for (let i = 0; i < bytes.length; i += CHUNK) {
-          s += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-        }
-        return btoa(s);
-      }
-    } catch {}
+      result = new Uint8Array(await NVUtilities.compress(raw, "gzip"));
+    } catch (e) {
+      console.warn("[NV] gzip of drawing failed, sending uncompressed", e);
+      result = raw;
+    }
 
-    throw new Error(
-      "This Niivue build does not support exporting the edited drawing as NIfTI. " +
-      "Implement backend save (upload edits) or use a Niivue build exposing saveDrawing()."
-    );
+    // chunked, because String.fromCharCode(...bytes) overflows the call stack
+    // on a volume-sized array
+    const CHUNK = 0x8000;
+    let binary = "";
+    for (let i = 0; i < result.length; i += CHUNK) {
+      binary += String.fromCharCode(...result.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+  }, []);
+
+  /** The four Niivue instances in VIEWS order, or [] before attach. */
+  const getViewers = useCallback((): Niivue[] => {
+    const nv = nvRef.current;
+    if (!nv) return [];
+    return VIEWS.map((v) => nv[v.key]);
   }, []);
 
   return {
     refs,
+    getViewers,
+    forceResizeAndDraw,
+    syncFrom,
     viewerOk,
     attachReady,
 

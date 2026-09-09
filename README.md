@@ -77,7 +77,7 @@ Weights are **never** baked into the image or committed — they are far past
 GitHub's file size limits. Download them from Google Drive:
 
 ```
-https://drive.google.com/drive/folders/1po6c_ogZZJr-FkMZljP1w_1HhSXylw4J?usp=sharing
+https://drive.google.com/drive/folders/1bVuHV8JZ1-rb4o42pffxVSlPxJ9xqbvc?usp=sharing
 ```
 
 Put the downloaded tree anywhere on the host and point `BAT_MODELS_HOST_DIR` at
